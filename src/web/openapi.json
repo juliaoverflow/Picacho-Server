@@ -1,0 +1,1295 @@
+{
+ "openapi": "3.1.0",
+ "info": {
+  "title": "Picacho Server admin API",
+  "version": "1",
+  "description": "Manage domains, accounts, aliases, the delivery queue and live settings. Authenticate with `Authorization: Bearer pmk_\u2026` using a token that has the `admin` scope (create one in the console under API & tokens)."
+ },
+ "servers": [
+  {
+   "url": "/api/v1"
+  }
+ ],
+ "security": [
+  {
+   "bearer": []
+  }
+ ],
+ "components": {
+  "securitySchemes": {
+   "bearer": {
+    "type": "http",
+    "scheme": "bearer"
+   }
+  },
+  "responses": {
+   "Error": {
+    "description": "Error",
+    "content": {
+     "application/json": {
+      "schema": {
+       "type": "object",
+       "properties": {
+        "error": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "schemas": {
+   "Account": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer"
+     },
+     "email": {
+      "type": "string"
+     },
+     "display_name": {
+      "type": "string"
+     },
+     "role": {
+      "type": "string",
+      "enum": [
+       "user",
+       "admin"
+      ]
+     },
+     "quota_bytes": {
+      "type": "integer"
+     },
+     "used_bytes": {
+      "type": "integer"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "can_send_external": {
+      "type": "boolean"
+     },
+     "forward_to": {
+      "type": "string"
+     },
+     "keep_copy": {
+      "type": "boolean"
+     },
+     "created_at": {
+      "type": "integer"
+     },
+     "last_login": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     }
+    }
+   },
+   "NewAccount": {
+    "type": "object",
+    "required": [
+     "email",
+     "password"
+    ],
+    "properties": {
+     "email": {
+      "type": "string"
+     },
+     "password": {
+      "type": "string"
+     },
+     "display_name": {
+      "type": "string"
+     },
+     "role": {
+      "type": "string",
+      "enum": [
+       "user",
+       "admin"
+      ]
+     },
+     "quota_mb": {
+      "type": "integer"
+     }
+    }
+   },
+   "AccountPatch": {
+    "type": "object",
+    "properties": {
+     "display_name": {
+      "type": "string"
+     },
+     "role": {
+      "type": "string"
+     },
+     "quota_mb": {
+      "type": "integer"
+     },
+     "active": {
+      "type": "boolean"
+     },
+     "can_send_external": {
+      "type": "boolean"
+     },
+     "forward_to": {
+      "type": "string"
+     },
+     "keep_copy": {
+      "type": "boolean"
+     }
+    }
+   },
+   "Domain": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer"
+     },
+     "name": {
+      "type": "string"
+     },
+     "mode": {
+      "type": "string",
+      "enum": [
+       "local",
+       "relay",
+       "webhook"
+      ]
+     },
+     "transport": {
+      "type": "string"
+     },
+     "catch_all": {
+      "type": "string"
+     },
+     "dkim_selector": {
+      "type": "string"
+     },
+     "dkim_public": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     }
+    }
+   },
+   "NewDomain": {
+    "type": "object",
+    "required": [
+     "name"
+    ],
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "mode": {
+      "type": "string"
+     },
+     "transport": {
+      "type": "string"
+     },
+     "dkim": {
+      "type": "boolean"
+     }
+    }
+   },
+   "DomainPatch": {
+    "type": "object",
+    "properties": {
+     "mode": {
+      "type": "string"
+     },
+     "transport": {
+      "type": "string"
+     },
+     "catch_all": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     }
+    }
+   },
+   "Alias": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer"
+     },
+     "source": {
+      "type": "string"
+     },
+     "destination": {
+      "type": "string"
+     },
+     "active": {
+      "type": "boolean"
+     }
+    }
+   },
+   "QueueItem": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer"
+     },
+     "sender": {
+      "type": "string"
+     },
+     "recipients": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "status": {
+      "type": "string"
+     },
+     "attempts": {
+      "type": "integer"
+     },
+     "last_error": {
+      "type": "string"
+     },
+     "next_attempt": {
+      "type": "integer"
+     }
+    }
+   }
+  }
+ },
+ "paths": {
+  "/overview": {
+   "get": {
+    "summary": "Server status and statistics",
+    "tags": [
+     "Server"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/accounts": {
+   "get": {
+    "summary": "List accounts",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Account"
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "post": {
+    "summary": "Create an account",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Account"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/NewAccount"
+       }
+      }
+     }
+    }
+   }
+  },
+  "/accounts/{id}": {
+   "get": {
+    "summary": "Get an account (with folders, aliases, client settings)",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ]
+   },
+   "patch": {
+    "summary": "Update an account",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Account"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/AccountPatch"
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ]
+   },
+   "delete": {
+    "summary": "Delete an account and its mail",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ]
+   }
+  },
+  "/accounts/{id}/password": {
+   "post": {
+    "summary": "Set an account's password",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "password"
+        ],
+        "properties": {
+         "password": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ]
+   }
+  },
+  "/domains": {
+   "get": {
+    "summary": "List domains",
+    "tags": [
+     "Domains"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Domain"
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "post": {
+    "summary": "Add a domain",
+    "tags": [
+     "Domains"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Domain"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/NewDomain"
+       }
+      }
+     }
+    }
+   }
+  },
+  "/domains/{id}": {
+   "get": {
+    "summary": "Get a domain with recommended DNS records",
+    "tags": [
+     "Domains"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Domain id or name"
+     }
+    ]
+   },
+   "patch": {
+    "summary": "Update a domain",
+    "tags": [
+     "Domains"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Domain"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/DomainPatch"
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Domain id or name"
+     }
+    ]
+   },
+   "delete": {
+    "summary": "Delete a domain (must have no accounts)",
+    "tags": [
+     "Domains"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Domain id or name"
+     }
+    ]
+   }
+  },
+  "/domains/{id}/dkim": {
+   "post": {
+    "summary": "Generate a new DKIM key",
+    "tags": [
+     "Domains"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Domain id or name"
+     }
+    ]
+   }
+  },
+  "/domains/{id}/dns": {
+   "get": {
+    "summary": "Check published DNS records",
+    "tags": [
+     "Domains"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Domain id or name"
+     }
+    ]
+   }
+  },
+  "/aliases": {
+   "get": {
+    "summary": "List aliases",
+    "tags": [
+     "Aliases"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Alias"
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "post": {
+    "summary": "Create an alias (source address or @domain for a catch-all)",
+    "tags": [
+     "Aliases"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "source",
+         "destination"
+        ],
+        "properties": {
+         "source": {
+          "type": "string"
+         },
+         "destination": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/aliases/{id}": {
+   "patch": {
+    "summary": "Update an alias",
+    "tags": [
+     "Aliases"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "destination": {
+          "type": "string"
+         },
+         "active": {
+          "type": "boolean"
+         }
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Alias id"
+     }
+    ]
+   },
+   "delete": {
+    "summary": "Delete an alias",
+    "tags": [
+     "Aliases"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Alias id"
+     }
+    ]
+   }
+  },
+  "/queue": {
+   "get": {
+    "summary": "List the outbound queue",
+    "tags": [
+     "Queue"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/QueueItem"
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/queue/{id}": {
+   "delete": {
+    "summary": "Remove a queued message",
+    "tags": [
+     "Queue"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Queue id"
+     }
+    ]
+   }
+  },
+  "/queue/{id}/retry": {
+   "post": {
+    "summary": "Retry a queued message now",
+    "tags": [
+     "Queue"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Queue id"
+     }
+    ]
+   }
+  },
+  "/settings": {
+   "get": {
+    "summary": "Live settings (secrets redacted)",
+    "tags": [
+     "Server"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "put": {
+    "summary": "Replace live settings",
+    "tags": [
+     "Server"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  },
+  "/events": {
+   "get": {
+    "summary": "Activity log",
+    "tags": [
+     "Server"
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "parameters": [
+     {
+      "name": "kind",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "schema": {
+       "type": "integer"
+      }
+     }
+    ]
+   }
+  }
+ }
+}

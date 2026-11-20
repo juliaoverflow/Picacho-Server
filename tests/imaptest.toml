@@ -1,0 +1,22 @@
+# Configuration used by scripts/imaptest.sh. Throwaway data under target/.
+hostname = "localhost"
+
+[listen]
+smtp = ["127.0.0.1:2525"]
+submission = ["127.0.0.1:2587"]
+submissions = []
+imap = ["0.0.0.0:2143"]
+imaps = ["0.0.0.0:2993"]
+managesieve = ["127.0.0.1:24190"]
+
+[storage]
+data_dir = "target/imaptest-data"
+
+[web]
+listen = ["127.0.0.1:2880"]
+
+[limits]
+max_connections_per_ip = 1000
+
+[log]
+level = "warn"

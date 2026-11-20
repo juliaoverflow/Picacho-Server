@@ -1,0 +1,18 @@
+# Rust build output (also holds dev data from config.dev.toml and test runs)
+/target
+
+# Web console: dependencies and build output (embedded by `cargo build`)
+/web/node_modules
+/web/dist
+
+# Local server state, secrets and machine-specific config
+/data
+config.toml
+.env
+*.pem
+*.key
+
+# Editor and OS files
+/.claude/
+.DS_Store
+*.log

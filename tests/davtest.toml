@@ -1,0 +1,22 @@
+# Configuration used by scripts/davtest.sh. Throwaway data under target/.
+hostname = "localhost"
+
+[listen]
+smtp = []
+submission = []
+submissions = []
+imap = []
+imaps = []
+managesieve = []
+
+[storage]
+data_dir = "target/davtest-data"
+
+[web]
+listen = ["0.0.0.0:2881"]
+
+[limits]
+max_connections_per_ip = 1000
+
+[log]
+level = "warn"

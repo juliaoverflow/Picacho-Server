@@ -1,0 +1,117 @@
+# Picacho Server configuration. EVERY setting is optional: with no file at all
+# the server runs with SQLite + local storage in ./data and standard ports.
+# Day-to-day settings (relays, routing, limits, security policy) are edited
+# in the web console and stored as "live settings" (see [storage.settings]).
+
+# Public host name used in SMTP/IMAP greetings and certificates.
+# Defaults to the machine's host name; can also be set during onboarding.
+# hostname = "mail.example.com"
+
+[listen]
+# Set any list to [] to disable that service.
+# smtp        = ["0.0.0.0:25"]    # inbound mail from the internet (MX)
+# submission  = ["0.0.0.0:587"]   # mail apps, STARTTLS + AUTH
+# submissions = ["0.0.0.0:465"]   # mail apps, implicit TLS
+# imap        = ["0.0.0.0:143"]   # STARTTLS
+# imaps       = ["0.0.0.0:993"]   # implicit TLS
+# managesieve = ["0.0.0.0:4190"]  # mail filters (RFC 5804)
+# proxy_protocol_from = []
+
+[tls]
+# PEM files. Without them a self-signed certificate is generated in
+# <data_dir>/tls (fine for testing; mail apps will warn).
+# cert = "/etc/letsencrypt/live/mail.example.com/fullchain.pem"
+# key  = "/etc/letsencrypt/live/mail.example.com/privkey.pem"
+# min_version = "1.2"             # or "1.3"
+# watch_files = false             # reload cert/key when they change on disk
+
+# [tls.acme]
+# Automatic certificates (Let's Encrypt by default). HTTP-01 challenges are
+# answered on http_listen (port 80) and on the console listeners.
+# accept_terms = true             # required: you agree to the CA's terms
+# contact = ["hostmaster@example.com"]
+# domains = ["mail.example.com", "mta-sts.example.com", "autoconfig.example.com"]  # default: the host name
+# http_listen = ["0.0.0.0:80"]
+# renew_days = 30
+# directory = "https://acme-v02.api.letsencrypt.org/directory"
+
+[storage]
+# data_dir = "data"               # base for everything stored locally
+# encrypt = false                 # AES-256-GCM for all messages/attachments
+# encryption_key_file = "/etc/picacho/storage.key"  # 32 bytes raw/hex/base64; generated in data_dir if omitted
+# cache_mb = 64                   # in-memory cache of recently read messages
+# full_text_index = true          # index for SEARCH BODY/HEADER (SQLite FTS5 trigram / pg_trgm)
+
+[storage.database]
+# Accounts, folders, flags, queue, sessions.
+# kind = "sqlite"                 # or "postgres"
+# url = "postgres://picacho:secret@db/picacho"
+# url_file = "/run/secrets/db-url"  # keeps the password out of this file
+# max_connections = 16
+
+[storage.messages]
+# Raw messages, content-addressed and deduplicated.
+# kind = "local"                  # "local", "s3" or "database"
+# path = "/srv/mail/messages"     # local only; default <data_dir>/messages
+# [storage.messages.s3]
+# bucket = "mail"
+# region = "us-east-1"
+# endpoint = "https://<account>.r2.cloudflarestorage.com"   # R2, MinIO, B2, ...
+# access_key_id = "..."
+# secret_access_key_file = "/run/secrets/s3-secret"
+# prefix = "messages"
+# path_style = false
+# allow_http = false
+
+# [storage.attachments]
+# Split attachments at least this large out of messages into their own
+# store (deduplicated across all mailboxes). Omit to keep them inline.
+# kind = "s3"                     # "local", "s3" or "database"
+# threshold_bytes = 65536
+# path = "/srv/mail/attachments"
+# [storage.attachments.s3]
+# bucket = "mail-attachments"
+
+# [storage.dav.files]
+# Where WebDAV files, calendars and contacts go. Each part defaults to the
+# same kind of store as messages, in its own directory or prefix.
+# kind = "s3"
+# [storage.dav.files.s3]
+# bucket = "dav-files"
+# [storage.dav.calendars]
+# kind = "database"
+# [storage.dav.contacts]
+# kind = "local"
+# path = "/srv/dav/contacts"
+
+[storage.settings]
+# Where web-console settings live: "database" (default) or "file".
+# kind = "file"
+# path = "/etc/picacho/live.toml"   # default <data_dir>/live.toml
+
+[web]
+# listen = ["0.0.0.0:8080"]
+# tls = false                     # serve the console over HTTPS with [tls]
+# public_url = "https://mail.example.com:8080"   # shown in the startup banner
+# session_hours = 12
+# trusted_proxies = ["127.0.0.1"] # honor X-Forwarded-For from these
+# metrics = true                  # Prometheus at /metrics
+# metrics_allow = ["127.0.0.1", "::1"]
+# metrics_token_file = "/run/secrets/metrics-token"   # or Authorization: Bearer <token>
+
+[log]
+# level = "info"                  # or a filter like "info,picacho_server=debug"
+# format = "text"                 # or "json"
+
+[limits]
+# Hard process limits. Policy limits are in the console (Storage → Limits).
+# max_connections = 10000
+# max_connections_per_ip = 64
+# imap_max_line = 65536
+# smtp_max_line = 4096
+# idle_timeout_secs = 1800
+# auth_timeout_secs = 60
+# shutdown_grace_secs = 30        # on SIGTERM, wait this long for sessions and deliveries
+
+[dns]
+# resolver = "system"             # "cloudflare", "google", "quad9"

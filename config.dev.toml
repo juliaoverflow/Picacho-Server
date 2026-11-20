@@ -1,0 +1,20 @@
+# Local development: unprivileged ports, data under target/dev-data.
+# Dev console login created through the setup wizard: alex@picacho.test / Dev-Console-Passw0rd
+hostname = "mail.picacho.test"
+
+[listen]
+smtp = ["127.0.0.1:2526"]
+submission = ["127.0.0.1:2588"]
+submissions = ["127.0.0.1:2466"]
+imap = ["127.0.0.1:2144"]
+imaps = ["127.0.0.1:2994"]
+
+[storage]
+data_dir = "target/dev-data"
+
+[storage.attachments]
+kind = "local"
+threshold_bytes = 65536
+
+[web]
+listen = ["127.0.0.1:8088"]
