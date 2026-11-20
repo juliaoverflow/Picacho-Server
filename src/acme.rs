@@ -91,7 +91,11 @@ pub async fn issue(state: &State) -> Result<String> {
         Some(k) => k,
         None => rcgen::KeyPair::generate()?,
     };
-    let params = rcgen::CertificateParams::new(names.clone())?;
+    let mut params = rcgen::CertificateParams::new(names.clone())?;
+    // rcgen's default subject ("rcgen self signed cert") isn't a host name,
+    // and CAs refuse a CSR whose common name isn't one of its names.
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(rcgen::DnType::CommonName, names[0].clone());
     let csr = params.serialize_request(&key)?;
     order.finalize_csr(csr.der()).await?;
     let chain = order.poll_certificate(&RetryPolicy::default()).await?;
