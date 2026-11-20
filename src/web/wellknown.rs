@@ -26,6 +26,7 @@ pub fn routes(state: State) -> Router {
         .route("/Autodiscover/Autodiscover.xml", get(autodiscover).post(autodiscover))
         .route("/.well-known/picacho/mobileconfig", get(mobileconfig))
         .route("/.well-known/picacho", get(discovery))
+        .route("/.well-known/oauth-protected-resource", get(protected_resource))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
@@ -106,8 +107,28 @@ async fn endpoints(state: &State, headers: &HeaderMap, email: &str) -> serde_jso
         "caldav": format!("{base}/dav/"),
         "carddav": format!("{base}/dav/"),
         "webdav": format!("{base}/dav/files/"),
-        "oauth": format!("{base}/.well-known/oauth-authorization-server"),
+        "oauth_resource": crate::resource::metadata(state).map(|_| format!("{base}/.well-known/oauth-protected-resource")),
+        "rest": format!("{base}/v1"),
     })
+}
+
+/// RFC 9728: where apps get tokens for this server (the identity provider).
+async fn protected_resource(AxState(state): AxState<State>) -> Response {
+    match crate::resource::metadata(&state) {
+        Some(m) => ([(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], axum::Json(m)).into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "").into_response(),
+    }
+}
+
+/// The provider's authorize and token endpoints, for mail-app autoconfig.
+async fn oauth_endpoints(state: &State) -> Option<(String, String, String)> {
+    let o = state.settings().auth.oidc.clone();
+    if !o.access_tokens {
+        return None;
+    }
+    let d = crate::oidc::discover(&o.issuer).await.ok()?;
+    let host = url::Url::parse(&d.issuer).ok()?.host_str()?.to_string();
+    Some((host, d.authorization_endpoint, d.token_endpoint))
 }
 
 /// Machine-readable discovery for apps and the identity provider.
@@ -131,8 +152,10 @@ async fn autoconfig(AxState(state): AxState<State>, headers: HeaderMap, Query(q)
         b = x(&brand)
     );
     let host = x(e["imap"]["host"].as_str().unwrap_or(""));
+    let oauth = oauth_endpoints(&state).await;
+    let oauth_auth = if oauth.is_some() { "      <authentication>OAuth2</authentication>\n" } else { "" };
     body.push_str(&format!(
-        "    <incomingServer type=\"imap\">\n      <hostname>{host}</hostname>\n      <port>{}</port>\n      <socketType>SSL</socketType>\n      <authentication>password-cleartext</authentication>\n      <authentication>OAuth2</authentication>\n      <username>%EMAILADDRESS%</username>\n    </incomingServer>\n",
+        "    <incomingServer type=\"imap\">\n      <hostname>{host}</hostname>\n      <port>{}</port>\n      <socketType>SSL</socketType>\n      <authentication>password-cleartext</authentication>\n{oauth_auth}      <username>%EMAILADDRESS%</username>\n    </incomingServer>\n",
         e["imap"]["port"]
     ));
     body.push_str(&format!(
@@ -140,19 +163,27 @@ async fn autoconfig(AxState(state): AxState<State>, headers: HeaderMap, Query(q)
         e["imap"]["starttls_port"]
     ));
     body.push_str(&format!(
-        "    <outgoingServer type=\"smtp\">\n      <hostname>{host}</hostname>\n      <port>{}</port>\n      <socketType>SSL</socketType>\n      <authentication>password-cleartext</authentication>\n      <authentication>OAuth2</authentication>\n      <username>%EMAILADDRESS%</username>\n    </outgoingServer>\n",
+        "    <outgoingServer type=\"smtp\">\n      <hostname>{host}</hostname>\n      <port>{}</port>\n      <socketType>SSL</socketType>\n      <authentication>password-cleartext</authentication>\n{oauth_auth}      <username>%EMAILADDRESS%</username>\n    </outgoingServer>\n",
         e["smtp"]["port"]
     ));
     body.push_str(&format!(
         "    <outgoingServer type=\"smtp\">\n      <hostname>{host}</hostname>\n      <port>{}</port>\n      <socketType>STARTTLS</socketType>\n      <authentication>password-cleartext</authentication>\n      <username>%EMAILADDRESS%</username>\n    </outgoingServer>\n  </emailProvider>\n",
         e["smtp"]["starttls_port"]
     ));
-    let oauth = format!("{}/oauth", crate::jmap::base_url(&state, &headers));
     body.push_str(&format!(
-        "  <addressBook type=\"carddav\">\n    <username>%EMAILADDRESS%</username>\n    <authentication>http-basic</authentication>\n    <serverURL>{}</serverURL>\n  </addressBook>\n  <calendar type=\"caldav\">\n    <username>%EMAILADDRESS%</username>\n    <authentication>http-basic</authentication>\n    <serverURL>{}</serverURL>\n  </calendar>\n  <oAuth2>\n    <issuer>{host}</issuer>\n    <scope>imap smtp jmap dav sieve</scope>\n    <authURL>{oauth}/authorize</authURL>\n    <tokenURL>{oauth}/token</tokenURL>\n  </oAuth2>\n</clientConfig>\n",
+        "  <addressBook type=\"carddav\">\n    <username>%EMAILADDRESS%</username>\n    <authentication>http-basic</authentication>\n    <serverURL>{}</serverURL>\n  </addressBook>\n  <calendar type=\"caldav\">\n    <username>%EMAILADDRESS%</username>\n    <authentication>http-basic</authentication>\n    <serverURL>{}</serverURL>\n  </calendar>\n",
         x(e["carddav"].as_str().unwrap_or("")),
         x(e["caldav"].as_str().unwrap_or(""))
     ));
+    if let Some((issuer, auth, token)) = oauth {
+        body.push_str(&format!(
+            "  <oAuth2>\n    <issuer>{}</issuer>\n    <scope>openid email offline_access mail.read mail.labels mail.compose mail.send calendar.write contacts.write</scope>\n    <authURL>{}</authURL>\n    <tokenURL>{}</tokenURL>\n  </oAuth2>\n",
+            x(&issuer),
+            x(&auth),
+            x(&token)
+        ));
+    }
+    body.push_str("</clientConfig>\n");
     text("application/xml", body)
 }
 

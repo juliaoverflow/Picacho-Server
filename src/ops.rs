@@ -709,7 +709,7 @@ async fn migrate(state: &State, account_id: i64, req: &MigrateRequest, job: &str
 
 const TABLES: &[&str] = &[
     "settings", "domains", "accounts", "aliases", "mailboxes", "subscriptions", "messages", "blob_refs", "blob_data", "queue", "expunged", "changes",
-    "api_tokens", "oauth_clients", "oauth_tokens", "uploads", "sieve_scripts", "vacation", "acl", "metadata", "relay_peers", "audit",
+    "api_tokens", "uploads", "sieve_scripts", "vacation", "acl", "metadata", "relay_peers", "audit",
     "dav_principals", "dav_nodes", "dav_changes", "bayes_tokens", "bayes_totals", "bayes_learned", "reports_in",
 ];
 

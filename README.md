@@ -39,7 +39,7 @@ Picacho Server is a mail server written in Rust: IMAP, JMAP, SMTP (MX and submis
 - **Storage**: SQLite or PostgreSQL for metadata; local disk, any S3-compatible store, or the database for messages; optional separate store for large attachments (deduplicated across all mailboxes); live settings in the database or a TOML file; optional AES-256-GCM encryption at rest.
 - **Web console**: onboarding wizard; navigation grouped into Mail (domains with DNS records and live checks, accounts, aliases), Delivery (queue, routing & relays) and Server (security, storage & limits, **Configuration**, **API & tokens**, activity); a ⌘K/Ctrl+K command palette to jump to any page, account, domain or alias; light/dark themes and Picacho's accent colors.
 - **Single sign-on (OpenID Connect)** for everyone who uses the console, administrators and mailbox users alike. Identities are linked by issuer + subject; mailboxes can be created on first sign-in, and an admin-groups claim decides who's an administrator. Password sign-in can be turned off (break-glass: `PICACHO_ALLOW_PASSWORD_LOGIN=1`), separately for the console and for mail apps.
-- **OAuth 2.0 for mail apps**: an authorization server (auth code + PKCE, refresh-token rotation with replay detection, revocation, optional dynamic registration). On the consent screen the person picks, per protocol, *No access / Read only / Read & write* for IMAP and JMAP and whether the app may send mail. Tokens work as JMAP Bearer tokens and with IMAP/SMTP `XOAUTH2`/`OAUTHBEARER`; read-only is enforced by the server. People can see and disconnect their apps.
+- **Access tokens from your identity provider** (e.g. Pinal Accounts): Picacho issues no OAuth tokens of its own. Apps get JWT access tokens from the provider (which shows the consent screen and lists connected apps) for this server's resource identifier; Picacho verifies them against the provider's JWKS and maps capability scopes (`mail.read`, `mail.send`, `calendar.write`, …) onto IMAP, SMTP, JMAP, CalDAV, CardDAV, ManageSieve and the REST APIs. They work as Bearer tokens and with IMAP/SMTP `XOAUTH2`/`OAUTHBEARER`; protected-resource metadata (RFC 9728) is at `/.well-known/oauth-protected-resource`.
 - **Branding**: name, logo, accent color, sign-in message and support links, applied to the console, sign-in and consent pages.
 - **Delivery security**: outbound MX delivery honors **MTA-STS** (RFC 8461) and **DANE** (RFC 7672, DNSSEC-validated TLSA), sends **SMTP TLS reports** (RFC 8460), and supports **REQUIRETLS** (RFC 8689), **DSN** (RFC 3461/3464: success, delay, failure, relayed), **CHUNKING/BDAT**, PIPELINING and SMTPUTF8. Forwarded mail is **ARC-sealed**; inbound ARC is verified. **DMARC aggregate reports** are sent to domains that ask, and incoming DMARC/TLS reports are parsed for the console. **ACME** (Let's Encrypt, HTTP-01) issues and renews certificates; every listener picks up new certificates without a restart. Our own MTA-STS policy is served at `mta-sts.<domain>`.
 - **Content filtering**: a built-in scorer (authentication results, rDNS/HELO, score-only DNSBLs, URI block lists, header heuristics, link/display mismatches, custom regex rules, sender allow/block lists), a **Bayesian classifier** trained when people move mail into or out of Junk (IMAP and JMAP, `$junk`/`$notjunk`), blocked attachment types (also inside zips), optional **rspamd** and **ClamAV** (clamd), and **greylisting**. Junk and reject thresholds; `X-Spam-*` headers.
@@ -151,21 +151,24 @@ Accounts are addressed by id or email (`/api/v1/accounts/sam@example.com`), doma
 
 **JMAP** — point a client at `https://mail.example.com:8080/.well-known/jmap` and sign in with the account password, an app password, or a Bearer token with the `jmap` scope. Each email belongs to exactly one mailbox (`maxMailboxesPerEmail: 1`), mirroring IMAP folders.
 
-**OAuth** — register an app under Sign-in & access (or allow self-registration). Metadata is at `/.well-known/oauth-authorization-server`; scopes are `imap`, `imap:read`, `smtp`, `jmap`, `jmap:read`.
+**Access tokens** — turn on *Sign-in & access → Access for apps* (live settings `auth.oidc.access_tokens` and `auth.oidc.resource`). Apps request the resource identifier from the identity provider (`resource=`; Pinal Accounts adds it for mail, contacts and calendar scopes) and send the JWT as a Bearer token. Scopes: `mail.read` (read-only IMAP/JMAP), `mail.read` + `mail.labels` + `mail.compose` (full IMAP/JMAP), `mail.send` (SMTP), `mail.settings` (Sieve, forwarding, vacation), `calendar.read`/`.write` (CalDAV), `contacts.read`/`.write` (CardDAV). Apps can never create app passwords, export a mailbox or start migrations. The token's `sub` picks the mailbox it is linked to.
 
-**Authorizations for integrations** — an identity provider or control panel can mint OAuth tokens for any account without a consent screen:
+**Provisioning** — an identity provider creates a linked mailbox with no password, and checks addresses first:
 
 ```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" https://mail.example.com:8080/api/v1/addresses/sam@example.com
 curl -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{"scope":"imap smtp jmap dav sieve account"}' \
-  https://mail.example.com:8080/api/v1/accounts/sam@example.com/authorizations
+  -d '{"email":"sam@example.com","display_name":"Sam","oidc_subject":"<provider sub>"}' \
+  https://mail.example.com:8080/api/v1/accounts
 ```
 
-The response has `access_token`, `refresh_token` (refresh at `/oauth/token` with the returned `client_id`) and the granted `scope`. Pass `client_id` to tie the grant to a registered app. Grants are listed and revoked at `/api/v1/accounts/{id}/authorizations`. `GET /api/v1/server` returns every endpoint (IMAP, SMTP, JMAP, DAV, OAuth) for provisioning.
+`PATCH /api/v1/accounts/{id}` with `oidc_subject` relinks (or `""` unlinks). `GET /api/v1/server` returns every endpoint (IMAP, SMTP, JMAP, DAV, REST, resource metadata) for provisioning.
 
-**Account API** (`/api/v1/me`, OAuth scope `account` or `account:read`, an API token, or a console session): profile and forwarding, addresses, Sieve scripts, vacation reply, app passwords, DAV password and URLs, export and IMAP migration — the things IMAP and JMAP don't cover.
+**Pinal Mail REST API** (`/v1/mail`, Bearer access token): `GET /labels`, `GET/POST /messages` (list with `label`, `q`, `limit`, `cursor`; send), `GET/PATCH /messages/{id}` (body; labels, read, starred), `POST /drafts`. It runs on the JMAP engine, so both always agree. Each operation checks its own scope (`mail.metadata`, `mail.read`, `mail.labels`, `mail.compose`, `mail.send`); with only `mail.metadata`, bodies and snippets are left out and searches don't look at bodies.
 
-**Scopes**: `imap`, `imap:read`, `smtp`, `jmap`, `jmap:read`, `dav`, `dav:read`, `sieve`, `account`, `account:read`, plus `admin` for API tokens.
+**Account API** (`/api/v1/me`, an access token with `mail.settings`, an API token with `account` or `account:read`, or a console session): profile and forwarding, addresses, Sieve scripts, vacation reply, app passwords, DAV password and URLs, export and IMAP migration — the things IMAP and JMAP don't cover.
+
+**API token scopes**: `imap`, `imap:read`, `smtp`, `jmap`, `jmap:read`, `dav`, `dav:read`, `sieve`, `account`, `account:read`, plus `admin`.
 
 **App passwords** — tokens with IMAP/SMTP access are accepted as the password for IMAP and SMTP, so each device can be revoked on its own. Users manage their own from their account page.
 
@@ -212,7 +215,7 @@ scripts/imaptest.sh fetch-body         # a single imaptest script
 
 `scripts/davtest.sh` runs the WebDAV **litmus** suite and Apple's **CalDAVTester** (CalDAV and CardDAV core suites) in Docker against a throwaway server. Current result: litmus **104/104** (basic, copymove, props, locks, http). CalDAVTester core suites: **407 passed, 78 failed, 101 skipped**. Skipped tests need features we don't claim (scheduling, sharing, proxies, attachments). Most remaining failures expect Apple CalendarServer behaviour: the `/.well-known` target being the server root, scheduling inbox and outbox, a non-ASCII test principal, and server-side repair of malformed data.
 
-`cargo test` also runs end-to-end tests for the REST API (tokens, CSRF rules), JMAP (compose a draft, submit it, move it to Sent, read it as the recipient), single sign-on against a mock identity provider (linking, provisioning, admin groups, open-redirect protection, password lockout, first-run setup via SSO) and OAuth (consent, PKCE, read-only JMAP and IMAP, refresh rotation and replay, revocation).
+`cargo test` also runs end-to-end tests for the REST API (tokens, CSRF rules), JMAP (compose a draft, submit it, move it to Sent, read it as the recipient), single sign-on against a mock identity provider (linking, provisioning, admin groups, open-redirect protection, password lockout, first-run setup via SSO) and provider access tokens (JWKS verification, refused issuers/audiences/algorithms/forgeries, scope mapping for IMAP, SMTP, JMAP, DAV and the account API, provisioning, and the REST API).
 
 ## Layout
 
@@ -229,7 +232,8 @@ scripts/imaptest.sh fetch-body         # a single imaptest script
 | `src/jmap/` | JMAP session, API dispatcher, uploads/downloads, push, mail methods |
 | `src/imap/sort.rs` | SORT and THREAD (RFC 5256) |
 | `src/oidc.rs` | OpenID Connect sign-in (relying party) |
-| `src/oauth.rs` | OAuth 2.0 authorization server for mail apps |
+| `src/resource.rs` | OAuth resource server: verifies the identity provider's access tokens |
+| `src/jmap/rest.rs` | Pinal Mail REST API (`/v1/mail`) on the JMAP engine |
 | `src/outbound/` | direct MX client: MTA-STS, DANE, TLS-RPT counters, DSN, CHUNKING, REQUIRETLS |
 | `src/filter/` | content filter, Bayes, rspamd and ClamAV clients, greylisting |
 | `src/sieve/` | Sieve parser and interpreter, delivery and vacation, ManageSieve |

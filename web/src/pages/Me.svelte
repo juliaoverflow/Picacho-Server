@@ -11,7 +11,6 @@
   import Copy from '../lib/Copy.svelte';
   import ClientSettings from './ClientSettings.svelte';
   import AppPasswords from '../lib/AppPasswords.svelte';
-  import Grants from '../lib/Grants.svelte';
   import VacationEditor from '../lib/VacationEditor.svelte';
   import SieveEditor from '../lib/SieveEditor.svelte';
   import DataTools from '../lib/DataTools.svelte';
@@ -108,7 +107,7 @@
       </div>
       <div class="card"><h3>Mail app settings</h3><p class="sub">Use these in Apple Mail, Thunderbird, Outlook, Picacho or any IMAP client.</p><ClientSettings {client} /></div>
       {#if ui.me.sso_linked}
-        <div class="notice" style="margin-top:14px"><Icon name="lock" size={18} /><span>You sign in with single sign-on.{ui.me.has_password ? '' : ' Your mailbox has no password, so mail apps use app passwords or OAuth.'}</span></div>
+        <div class="notice" style="margin-top:14px"><Icon name="lock" size={18} /><span>You sign in with single sign-on.{ui.me.has_password ? '' : ' Your mailbox has no password, so mail apps use app passwords or sign in with your account.'}</span></div>
       {/if}
       {#if ui.me.has_password}
         <form class="card" onsubmit={change}>
@@ -145,11 +144,12 @@
         <p class="sub">Give each mail, calendar or contacts app its own password you can revoke any time.{servers?.jmap ? ' JMAP clients connect at ' : ''}{#if servers?.jmap}<code>{servers.jmap}</code>.{/if}</p>
         <AppPasswords />
       </div>
-      <div class="card">
-        <h3>Connected apps</h3>
-        <p class="sub">Apps you've allowed through the consent screen. Disconnect any you don't use.</p>
-        <Grants />
-      </div>
+      {#if ui.status?.auth?.provider}
+        <div class="card row">
+          <div style="flex:1"><h3>Connected apps</h3><p class="sub" style="margin:0">Apps get access to your mailbox through your {ui.status.auth.provider.name} account. See and disconnect them there.</p></div>
+          <a class="btn" href={`${ui.status.auth.provider.issuer}/account`} target="_blank" rel="noopener"><Icon name="external" size={16} /> Manage apps</a>
+        </div>
+      {/if}
       {#if servers?.apple_profile}
         <div class="card row">
           <div style="flex:1"><h3>Apple devices</h3><p class="sub" style="margin:0">Install a profile that sets up Mail, Calendar and Contacts on iPhone, iPad or Mac.</p></div>

@@ -27,7 +27,6 @@ struct Assets;
 pub fn router(state: State) -> Router {
     api::routes(state.clone())
         .merge(crate::jmap::routes(state.clone()))
-        .merge(crate::oauth::routes(state.clone()))
         .merge(crate::relay::routes(state.clone()))
         .merge(wellknown::routes(state.clone()))
         .merge(crate::dav::routes(state.clone()))

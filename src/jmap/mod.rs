@@ -8,6 +8,7 @@
 //! never do, so cookies can't be used for cross-site requests.
 mod extra;
 mod mail;
+mod rest;
 
 use crate::db::Account;
 use crate::state::State;
@@ -34,7 +35,7 @@ pub const MAX_OBJECTS: usize = 1000;
 
 pub fn routes(state: State) -> Router {
     let upload_limit = state.settings().limits.max_message_bytes as usize + 1024;
-    Router::new()
+    let jmap = Router::new()
         .route("/.well-known/jmap", get(session))
         .route("/jmap/session", get(session))
         .route("/jmap/api", post(api).layer(DefaultBodyLimit::max(MAX_REQUEST)))
@@ -42,7 +43,9 @@ pub fn routes(state: State) -> Router {
         .route("/jmap/upload/{account}/", post(upload).layer(DefaultBodyLimit::max(upload_limit)))
         .route("/jmap/download/{account}/{blob}/{name}", get(download))
         .route("/jmap/eventsource", get(eventsource))
-        .with_state(state)
+        .with_state(state.clone());
+    // The Pinal Mail REST API sits on the same engine.
+    jmap.merge(rest::routes(state))
 }
 
 fn problem(status: StatusCode, kind: &str, detail: &str) -> Response {
@@ -87,7 +90,10 @@ async fn authenticate_access(
             },
             None => {
                 let mut r = unauthorized();
-                r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer error=\"invalid_token\""));
+                let c = crate::resource::challenge(state, &base_url(state, headers), Some("invalid_token"));
+                if let Ok(v) = HeaderValue::from_str(&c) {
+                    r.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+                }
                 Err(r)
             }
         };

@@ -3,7 +3,7 @@
  "info": {
   "title": "Picacho Server admin API",
   "version": "1",
-  "description": "Manage domains, accounts, aliases, the delivery queue and live settings. Authenticate with `Authorization: Bearer pmk_\u2026` using a token that has the `admin` scope (create one in the console under API & tokens)."
+  "description": "Manage domains, accounts, aliases, the delivery queue and live settings. Authenticate with `Authorization: Bearer pmk_…` using a token that has the `admin` scope (create one in the console under API & tokens)."
  },
  "servers": [
   {
@@ -91,15 +91,15 @@
    "NewAccount": {
     "type": "object",
     "required": [
-     "email",
-     "password"
+     "email"
     ],
     "properties": {
      "email": {
       "type": "string"
      },
      "password": {
-      "type": "string"
+      "type": "string",
+      "description": "Required unless oidc_subject is given."
      },
      "display_name": {
       "type": "string"
@@ -113,6 +113,10 @@
      },
      "quota_mb": {
       "type": "integer"
+     },
+     "oidc_subject": {
+      "type": "string",
+      "description": "The identity provider's `sub` for this person. Links the mailbox, so single sign-on and the provider's access tokens resolve to it. 409 if the identity already has a mailbox."
      }
     }
    },
@@ -139,6 +143,10 @@
      },
      "keep_copy": {
       "type": "boolean"
+     },
+     "oidc_subject": {
+      "type": "string",
+      "description": "Link the mailbox to this identity provider subject; an empty string unlinks it."
      }
     }
    },
@@ -1289,6 +1297,63 @@
       }
      }
     ]
+   }
+  },
+  "/addresses/{address}": {
+   "get": {
+    "summary": "Check an address",
+    "description": "Whether a new mailbox can have this address. `reason` is `invalid`, `domain` (not a local domain here) or `taken` (an account or alias uses it).",
+    "tags": [
+     "Accounts"
+    ],
+    "parameters": [
+     {
+      "name": "address",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "address": {
+           "type": "string"
+          },
+          "available": {
+           "type": "boolean"
+          },
+          "reason": {
+           "type": [
+            "string",
+            "null"
+           ],
+           "enum": [
+            "invalid",
+            "domain",
+            "taken",
+            null
+           ]
+          }
+         }
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
    }
   }
  }

@@ -87,61 +87,76 @@ pub enum Service {
 }
 
 /// Scopes: `imap`, `imap:read`, `smtp`, `jmap`, `jmap:read`, `sieve`,
-/// `dav`, `dav:read`, `account`, `account:read`, `admin`, and the older
-/// `mail` (= imap + smtp).
+/// `dav`, `dav:read` (every DAV section), `caldav`, `caldav:read`,
+/// `carddav`, `carddav:read`, `account`, `account:read`, `admin`, and the
+/// older `mail` (= imap + smtp). Tokens from the identity provider are
+/// translated by `resource::map_scopes` and marked external.
 pub fn access(scopes: &str, svc: Service) -> Access {
     let has = |x: &str| scopes.split([',', ' ']).any(|s| s == x);
+    let external = has(crate::resource::EXTERNAL);
     match svc {
         Service::Imap if has("imap") || has("mail") => Access::Write,
         Service::Imap if has("imap:read") => Access::Read,
         Service::Smtp if has("smtp") || has("mail") => Access::Write,
         Service::Jmap if has("jmap") => Access::Write,
         Service::Jmap if has("jmap:read") => Access::Read,
-        Service::Sieve if has("sieve") || has("account") || has("mail") || has("imap") => Access::Write,
-        Service::Dav if has("dav") => Access::Write,
-        Service::Dav if has("dav:read") => Access::Read,
+        // Filters can forward mail, so outside apps need mail.settings for them.
+        Service::Sieve if has("sieve") || has("account") || (!external && (has("mail") || has("imap"))) => Access::Write,
+        Service::Dav => ["files", "calendars", "addressbooks"].iter().map(|s| dav_access(scopes, s)).max().unwrap_or(Access::None),
         Service::Account if has("account") => Access::Write,
         Service::Account if has("account:read") => Access::Read,
         _ => Access::None,
     }
 }
 
+/// Access to one DAV section (`files`, `calendars` or `addressbooks`).
+pub fn dav_access(scopes: &str, section: &str) -> Access {
+    let has = |x: &str| scopes.split([',', ' ']).any(|s| s == x);
+    let (w, r) = match section {
+        "calendars" => ("caldav", "caldav:read"),
+        "addressbooks" => ("carddav", "carddav:read"),
+        _ => ("", ""),
+    };
+    if has("dav") || (!w.is_empty() && has(w)) {
+        Access::Write
+    } else if has("dav:read") || (!r.is_empty() && has(r)) {
+        Access::Read
+    } else {
+        Access::None
+    }
+}
+
 pub const VALID_SCOPES: [&str; 12] = ["admin", "imap", "imap:read", "smtp", "jmap", "jmap:read", "mail", "sieve", "dav", "dav:read", "account", "account:read"];
 
-pub const OAUTH_ACCESS_PREFIX: &str = "pmo_";
-pub const OAUTH_REFRESH_PREFIX: &str = "pmr_";
-pub const OAUTH_CODE_PREFIX: &str = "pmc_";
-
-/// A bearer credential: API token (`pmk_`) or OAuth access token (`pmo_`).
+/// A bearer credential: an API token / app password (`pmk_`) or an access
+/// token from the identity provider (a JWT, see `resource`).
 pub struct Principal {
     pub account: Account,
     pub scopes: String,
-    pub oauth: bool,
+    /// Issued by the identity provider rather than created here.
+    pub external: bool,
 }
 
 pub async fn bearer_principal(state: &State, token: &str) -> Option<Principal> {
-    if token.len() > 200 {
-        return None;
-    }
     if token.starts_with(TOKEN_PREFIX) {
-        let (account, t) = token_auth(state, token).await?;
-        return Some(Principal { account, scopes: t.scopes, oauth: false });
-    }
-    if token.starts_with(OAUTH_ACCESS_PREFIX) {
-        if !state.settings().oauth.enabled {
+        if token.len() > 200 {
             return None;
         }
-        let t = state.db.take_oauth_token(&crate::util::sha256_hex(token.as_bytes()), "access", false).await.ok()??;
-        let account = state.db.get_account(t.account_id).await.ok()??;
-        return account.active.then_some(Principal { account, scopes: t.scopes, oauth: true });
+        let (account, t) = token_auth(state, token).await?;
+        return Some(Principal { account, scopes: t.scopes, external: false });
     }
-    None
+    crate::resource::principal(state, token).await
+}
+
+/// Whether a password field holds a token rather than a password.
+pub fn is_token(password: &str) -> bool {
+    password.starts_with(TOKEN_PREFIX) || crate::resource::looks_like_jwt(password)
 }
 
 /// Sign in to a mail service with a password, app password or OAuth token
-/// (as the password, or via SASL XOAUTH2/OAUTHBEARER).
+/// or provider access token (as the password, or via SASL XOAUTH2/OAUTHBEARER).
 pub async fn login_service(state: &State, email: &str, password: &str, ip: IpAddr, svc: Service) -> Result<(Account, Access), AuthError> {
-    if password.starts_with(TOKEN_PREFIX) || password.starts_with(OAUTH_ACCESS_PREFIX) {
+    if is_token(password) {
         let sec = state.settings().security.clone();
         let allowlisted = crate::util::ip_in_list(ip, &sec.allowlist);
         if !allowlisted && state.limiter.is_banned(ip) {

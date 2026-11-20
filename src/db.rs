@@ -195,35 +195,6 @@ impl ApiToken {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct OAuthClient {
-    pub client_id: String,
-    pub name: String,
-    pub redirect_uris: Vec<String>,
-    /// Scopes the client may request (space separated).
-    pub scopes: String,
-    pub dynamic: bool,
-    pub confidential: bool,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct OAuthToken {
-    /// code | access | refresh
-    pub kind: String,
-    pub client_id: String,
-    pub account_id: i64,
-    pub scopes: String,
-    pub redirect_uri: String,
-    /// PKCE S256 challenge (codes only).
-    pub challenge: String,
-    /// Shared by all tokens from one authorization, for revocation.
-    pub family: String,
-    pub expires_at: i64,
-    pub created_at: i64,
-    pub last_used: Option<i64>,
-}
-
 /// Result of a STORE.
 pub struct FlagResult {
     /// (uid, flags, modseq) for every message that exists.
@@ -404,15 +375,9 @@ fn schema(kind: &DatabaseKind) -> Vec<String> {
             id {id}, account_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL,
             token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL, scopes TEXT NOT NULL,
             created_at {int} NOT NULL, last_used {int}, expires_at {int})"),
-        s("CREATE TABLE IF NOT EXISTS oauth_clients (
-            id {id}, client_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, secret_hash TEXT,
-            redirect_uris TEXT NOT NULL, scopes TEXT NOT NULL, dynamic {int} NOT NULL DEFAULT 0, created_at {int} NOT NULL)"),
-        s("CREATE TABLE IF NOT EXISTS oauth_tokens (
-            id {id}, token_hash TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, client_id TEXT NOT NULL,
-            account_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, scopes TEXT NOT NULL,
-            redirect_uri TEXT NOT NULL DEFAULT '', challenge TEXT NOT NULL DEFAULT '', family TEXT NOT NULL,
-            expires_at {int} NOT NULL, created_at {int} NOT NULL, last_used {int})"),
-        s("CREATE INDEX IF NOT EXISTS oauth_tokens_family ON oauth_tokens (family)"),
+        // Picacho no longer issues OAuth tokens (the identity provider does).
+        s("DROP TABLE IF EXISTS oauth_tokens"),
+        s("DROP TABLE IF EXISTS oauth_clients"),
         s("CREATE TABLE IF NOT EXISTS uploads (
             id {id}, account_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, blob TEXT NOT NULL,
             size {int} NOT NULL, ctype TEXT NOT NULL, created_at {int} NOT NULL)"),
@@ -1939,161 +1904,6 @@ impl Db {
     pub async fn set_role(&self, id: i64, role: &str) -> Result<()> {
         let _g = self.wl().await;
         sqlx::query("UPDATE accounts SET role = $1 WHERE id = $2").bind(role).bind(id).execute(&self.pool).await?;
-        Ok(())
-    }
-
-    // ---------- OAuth clients ----------
-    pub async fn create_oauth_client(&self, c: &OAuthClient, secret_hash: Option<&str>) -> Result<()> {
-        let _g = self.wl().await;
-        sqlx::query(
-            "INSERT INTO oauth_clients (client_id, name, secret_hash, redirect_uris, scopes, dynamic, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(&c.client_id)
-        .bind(&c.name)
-        .bind(secret_hash)
-        .bind(serde_json::to_string(&c.redirect_uris)?)
-        .bind(&c.scopes)
-        .bind(c.dynamic as i64)
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    fn client_from(r: &AnyRow) -> Result<(OAuthClient, Option<String>)> {
-        let uris: String = r.try_get("redirect_uris")?;
-        Ok((
-            OAuthClient {
-                client_id: r.try_get("client_id")?,
-                name: r.try_get("name")?,
-                redirect_uris: serde_json::from_str(&uris).unwrap_or_default(),
-                scopes: r.try_get("scopes")?,
-                dynamic: b(r.try_get("dynamic")?),
-                confidential: r.try_get::<Option<String>, _>("secret_hash")?.is_some(),
-                created_at: r.try_get("created_at")?,
-            },
-            r.try_get("secret_hash")?,
-        ))
-    }
-
-    /// The client and its secret hash (None for public clients).
-    pub async fn oauth_client(&self, client_id: &str) -> Result<Option<(OAuthClient, Option<String>)>> {
-        let r = sqlx::query("SELECT client_id, name, secret_hash, redirect_uris, scopes, dynamic, created_at FROM oauth_clients WHERE client_id = $1")
-            .bind(client_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        r.as_ref().map(Self::client_from).transpose()
-    }
-
-    pub async fn list_oauth_clients(&self) -> Result<Vec<OAuthClient>> {
-        let rows = sqlx::query("SELECT client_id, name, secret_hash, redirect_uris, scopes, dynamic, created_at FROM oauth_clients ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(|r| Self::client_from(r).map(|x| x.0)).collect()
-    }
-
-    pub async fn delete_oauth_client(&self, client_id: &str) -> Result<bool> {
-        let _g = self.wl().await;
-        sqlx::query("DELETE FROM oauth_tokens WHERE client_id = $1").bind(client_id).execute(&self.pool).await?;
-        let r = sqlx::query("DELETE FROM oauth_clients WHERE client_id = $1").bind(client_id).execute(&self.pool).await?;
-        Ok(r.rows_affected() > 0)
-    }
-
-    // ---------- OAuth codes and tokens ----------
-    pub async fn insert_oauth_token(&self, t: &OAuthToken, hash: &str) -> Result<()> {
-        let _g = self.wl().await;
-        sqlx::query(
-            "INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scopes, redirect_uri, challenge, family, expires_at, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        )
-        .bind(hash)
-        .bind(&t.kind)
-        .bind(&t.client_id)
-        .bind(t.account_id)
-        .bind(&t.scopes)
-        .bind(&t.redirect_uri)
-        .bind(&t.challenge)
-        .bind(&t.family)
-        .bind(t.expires_at)
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    fn oauth_token_from(r: &AnyRow) -> Result<OAuthToken> {
-        Ok(OAuthToken {
-            kind: r.try_get("kind")?,
-            client_id: r.try_get("client_id")?,
-            account_id: r.try_get("account_id")?,
-            scopes: r.try_get("scopes")?,
-            redirect_uri: r.try_get("redirect_uri")?,
-            challenge: r.try_get("challenge")?,
-            family: r.try_get("family")?,
-            expires_at: r.try_get("expires_at")?,
-            created_at: r.try_get("created_at")?,
-            last_used: r.try_get("last_used")?,
-        })
-    }
-
-    const OAUTH_COLS: &'static str = "kind, client_id, account_id, scopes, redirect_uri, challenge, family, expires_at, created_at, last_used";
-
-    /// Look up a live token of `kind`. Codes and refresh tokens are consumed (single use).
-    pub async fn take_oauth_token(&self, hash: &str, kind: &str, consume: bool) -> Result<Option<OAuthToken>> {
-        let r = sqlx::query(&format!("SELECT {} FROM oauth_tokens WHERE token_hash = $1 AND kind = $2", Self::OAUTH_COLS))
-            .bind(hash)
-            .bind(kind)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(r) = r else { return Ok(None) };
-        let t = Self::oauth_token_from(&r)?;
-        let _g = self.wl().await;
-        if consume {
-            sqlx::query("DELETE FROM oauth_tokens WHERE token_hash = $1").bind(hash).execute(&self.pool).await?;
-        } else if t.last_used.is_none_or(|l| now() - l > 60) {
-            sqlx::query("UPDATE oauth_tokens SET last_used = $1 WHERE token_hash = $2").bind(now()).bind(hash).execute(&self.pool).await?;
-        }
-        if t.expires_at < now() {
-            return Ok(None);
-        }
-        Ok(Some(t))
-    }
-
-    /// Revoke every token issued from one authorization (a "grant").
-    pub async fn revoke_oauth_family(&self, family: &str, account_id: Option<i64>) -> Result<bool> {
-        let _g = self.wl().await;
-        let r = match account_id {
-            Some(a) => sqlx::query("DELETE FROM oauth_tokens WHERE family = $1 AND account_id = $2").bind(family).bind(a).execute(&self.pool).await?,
-            None => sqlx::query("DELETE FROM oauth_tokens WHERE family = $1").bind(family).execute(&self.pool).await?,
-        };
-        Ok(r.rows_affected() > 0)
-    }
-
-    /// Active grants (one per refresh-token family) with client names.
-    pub async fn oauth_grants(&self, account_id: Option<i64>) -> Result<Vec<serde_json::Value>> {
-        let base = "SELECT t.family, t.client_id, t.account_id, t.scopes, t.created_at, t.expires_at, t.last_used, c.name, a.email
-                    FROM oauth_tokens t LEFT JOIN oauth_clients c ON c.client_id = t.client_id JOIN accounts a ON a.id = t.account_id
-                    WHERE t.kind = 'refresh' AND t.expires_at > $1";
-        let rows = match account_id {
-            Some(id) => sqlx::query(&format!("{base} AND t.account_id = $2 ORDER BY t.created_at DESC")).bind(now()).bind(id).fetch_all(&self.pool).await?,
-            None => sqlx::query(&format!("{base} ORDER BY t.created_at DESC")).bind(now()).fetch_all(&self.pool).await?,
-        };
-        Ok(rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "family": r.get::<String, _>(0), "client_id": r.get::<String, _>(1), "account_id": r.get::<i64, _>(2),
-                    "scopes": r.get::<String, _>(3), "created_at": r.get::<i64, _>(4), "expires_at": r.get::<i64, _>(5),
-                    "last_used": r.get::<Option<i64>, _>(6), "client": r.get::<Option<String>, _>(7), "account": r.get::<String, _>(8),
-                })
-            })
-            .collect())
-    }
-
-    pub async fn prune_oauth(&self) -> Result<()> {
-        let _g = self.wl().await;
-        sqlx::query("DELETE FROM oauth_tokens WHERE expires_at < $1").bind(now()).execute(&self.pool).await?;
         Ok(())
     }
 

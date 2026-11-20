@@ -2394,6 +2394,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
+ "ring",
  "rrule",
  "rust-embed",
  "rustls",
