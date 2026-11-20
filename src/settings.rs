@@ -14,7 +14,6 @@ pub struct LiveSettings {
     pub limits: LimitSettings,
     pub delivery: DeliverySettings,
     pub auth: AuthSettings,
-    pub oauth: OAuthSettings,
     pub branding: Branding,
     pub filter: FilterSettings,
     pub reports: ReportSettings,
@@ -304,6 +303,13 @@ pub struct OidcSettings {
     pub auto_create_accounts: bool,
     /// Refuse identities whose email_verified claim is false.
     pub require_verified_email: bool,
+    /// Accept the provider's OAuth access tokens (JWTs signed with its JWKS)
+    /// for IMAP, SMTP, JMAP, DAV, ManageSieve and the REST APIs. The provider
+    /// is the only authorization server; this server never issues tokens.
+    pub access_tokens: bool,
+    /// This server's resource identifier (RFC 8707): tokens must carry it in
+    /// `aud`. Apps request it with `resource=`.
+    pub resource: String,
 }
 
 impl Default for OidcSettings {
@@ -321,24 +327,9 @@ impl Default for OidcSettings {
             allowed_domains: vec![],
             auto_create_accounts: false,
             require_verified_email: true,
+            access_tokens: false,
+            resource: String::new(),
         }
-    }
-}
-
-/// OAuth 2.0 authorization server for mail clients (JMAP, IMAP, SMTP).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct OAuthSettings {
-    pub enabled: bool,
-    /// Let clients register themselves (RFC 7591).
-    pub dynamic_registration: bool,
-    pub access_token_minutes: u64,
-    pub refresh_token_days: u64,
-}
-
-impl Default for OAuthSettings {
-    fn default() -> Self {
-        Self { enabled: true, dynamic_registration: false, access_token_minutes: 60, refresh_token_days: 30 }
     }
 }
 
@@ -702,8 +693,13 @@ impl LiveSettings {
         if !self.auth.web_password_login && !o.enabled {
             return Err("Turn on single sign-on before turning off password sign-in.".into());
         }
-        if self.oauth.access_token_minutes == 0 || self.oauth.refresh_token_days == 0 {
-            return Err("Token lifetimes must be at least 1.".into());
+        if o.access_tokens {
+            if !(o.issuer.starts_with("https://") || is_local_http(&o.issuer)) {
+                return Err("Accepting access tokens needs the identity provider's issuer URL.".into());
+            }
+            if url::Url::parse(o.resource.trim()).is_err() {
+                return Err("Set this server's resource identifier (an absolute URL) to accept access tokens.".into());
+            }
         }
         if self.delivery.retry_minutes.is_empty() {
             return Err("retry schedule needs at least one value".into());

@@ -1,5 +1,4 @@
-//! End-to-end tests for Sieve, vacation, filtering, BDAT/DSN, admin-issued
-//! OAuth authorizations (account API, CalDAV, JMAP) and the relay link.
+//! End-to-end tests for Sieve, vacation, filtering, BDAT/DSN and the relay link.
 use picacho_server::config::Config;
 use picacho_server::server::{spawn_listener, Proto};
 use picacho_server::state::{AppState, State};
@@ -140,92 +139,6 @@ async fn filter_blocks_executables_and_bdat_dsn_work() {
     let r = c.reply().await;
     assert!(r.starts_with("250"), "{r}");
     assert_eq!(folder_count(&s.state, "bob@example.test", "INBOX").await, 1);
-}
-
-#[tokio::test]
-async fn admin_authorization_gives_account_dav_and_jmap_access() {
-    let s = server("example.test").await;
-    let tok = admin_token(&s, "example.test").await;
-    let base = format!("http://{}", s.web);
-    let http = reqwest::Client::new();
-    let r: Value = http
-        .post(format!("{base}/api/v1/accounts/bob@example.test/authorizations"))
-        .bearer_auth(&tok)
-        .json(&json!({"scope": "account dav jmap"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let access = r["access_token"].as_str().unwrap_or_else(|| panic!("{r}")).to_string();
-    assert!(r["refresh_token"].as_str().is_some());
-    assert_eq!(r["scope"], "jmap dav account");
-
-    // Account self-service: set a vacation reply.
-    let me: Value = http.get(format!("{base}/api/v1/me")).bearer_auth(&access).send().await.unwrap().json().await.unwrap();
-    assert_eq!(me["email"], "bob@example.test");
-    let v = http
-        .put(format!("{base}/api/v1/me/vacation"))
-        .bearer_auth(&access)
-        .json(&json!({"enabled": true, "subject": "Out", "text_body": "Back Monday"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(v.status().is_success());
-
-    // JMAP sees the same vacation response.
-    let j: Value = http
-        .post(format!("{base}/jmap/api"))
-        .bearer_auth(&access)
-        .json(&json!({"using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:vacationresponse"],
-            "methodCalls": [["VacationResponse/get", {"accountId": format!("a{}", me["id"])}, "0"]]}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(j["methodResponses"][0][1]["list"][0]["subject"], "Out", "{j}");
-
-    // CalDAV with the same token.
-    let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//t//EN\r\nBEGIN:VEVENT\r\nUID:ev1\r\nDTSTAMP:20270101T000000Z\r\nDTSTART:20270105T100000Z\r\nDURATION:PT1H\r\nSUMMARY:Planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-    let put = http
-        .put(format!("{base}/dav/calendars/bob@example.test/default/ev1.ics"))
-        .bearer_auth(&access)
-        .header("Content-Type", "text/calendar")
-        .body(ics)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(put.status().as_u16(), 201);
-    let q = format!(
-        r#"<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20270105T000000Z" end="20270106T000000Z"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"#
-    );
-    let rep = http
-        .request(reqwest::Method::from_bytes(b"REPORT").unwrap(), format!("{base}/dav/calendars/bob@example.test/default/"))
-        .bearer_auth(&access)
-        .header("Depth", "1")
-        .body(q)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(rep.status().as_u16(), 207);
-    assert!(rep.text().await.unwrap().contains("ev1.ics"));
-    // Without the dav scope the same request is refused.
-    let r2: Value = http
-        .post(format!("{base}/api/v1/accounts/bob@example.test/authorizations"))
-        .bearer_auth(&tok)
-        .json(&json!({"scope": "imap"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let imap_only = r2["access_token"].as_str().unwrap().to_string();
-    let denied = http.get(format!("{base}/dav/calendars/bob@example.test/default/ev1.ics")).bearer_auth(&imap_only).send().await.unwrap();
-    assert_eq!(denied.status().as_u16(), 403);
 }
 
 #[tokio::test]

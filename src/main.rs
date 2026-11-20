@@ -206,7 +206,6 @@ async fn serve(cfg: Config, path: PathBuf) -> anyhow::Result<()> {
             loop {
                 let _ = st.db.prune_events(30).await;
                 let _ = st.db.prune_changes(30).await;
-                let _ = st.db.prune_oauth().await;
                 if let Ok(blobs) = st.db.expire_uploads(24 * 3600).await {
                     for b in blobs {
                         if st.db.release_blob(&b).await.unwrap_or(false) {

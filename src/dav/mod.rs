@@ -617,7 +617,11 @@ fn secure(state: &State, headers: &HeaderMap, peer: SocketAddr) -> bool {
         || (sec.allow_plaintext_localhost && crate::util::is_loopback(peer.ip()))
 }
 
-async fn authenticate(state: &State, headers: &HeaderMap, peer: SocketAddr) -> Result<(Principal, bool), Response> {
+/// What a credential may do: everything (`None`, a password) or what its
+/// token scopes allow, per section.
+type Grant = Option<String>;
+
+async fn authenticate(state: &State, headers: &HeaderMap, peer: SocketAddr) -> Result<(Principal, bool, Grant), Response> {
     use crate::auth::{access, Access, Service};
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
     if let Some(t) = auth.strip_prefix("Bearer ").map(str::trim) {
@@ -627,7 +631,7 @@ async fn authenticate(state: &State, headers: &HeaderMap, peer: SocketAddr) -> R
             return Err(empty(StatusCode::FORBIDDEN));
         }
         let Ok(Some(pr)) = principal_for_account(state, &p.account).await else { return Err(empty(StatusCode::FORBIDDEN)) };
-        return Ok((pr, lvl == Access::Read));
+        return Ok((pr, lvl == Access::Read, Some(p.scopes)));
     }
     let Some(b) = auth.strip_prefix("Basic ") else { return Err(unauthorized(state)) };
     if !secure(state, headers, peer) {
@@ -650,7 +654,7 @@ async fn authenticate(state: &State, headers: &HeaderMap, peer: SocketAddr) -> R
             let ok = tokio::task::spawn_blocking(move || crate::auth::verify_password(&pw, &h)).await.unwrap_or(false);
             if ok {
                 state.limiter.success(ip);
-                return Ok((p, false));
+                return Ok((p, false, None));
             }
             if p.account_id.is_none() {
                 crate::metrics::AUTH_FAILURES.inc();
@@ -661,9 +665,15 @@ async fn authenticate(state: &State, headers: &HeaderMap, peer: SocketAddr) -> R
             }
         }
     }
+    let token = crate::auth::is_token(pass);
     match crate::auth::login_service(state, user, pass, ip, Service::Dav).await {
         Ok((acc, lvl)) => match principal_for_account(state, &acc).await {
-            Ok(Some(p)) if p.active => Ok((p, lvl == Access::Read)),
+            // A token used as the password keeps its per-section limits.
+            Ok(Some(p)) if p.active && token => match crate::auth::bearer_principal(state, pass).await {
+                Some(b) => Ok((p, lvl == Access::Read, Some(b.scopes))),
+                None => Err(unauthorized(state)),
+            },
+            Ok(Some(p)) if p.active => Ok((p, lvl == Access::Read, None)),
             _ => Err(empty(StatusCode::FORBIDDEN)),
         },
         Err(crate::auth::AuthError::Banned) => Err(empty(StatusCode::TOO_MANY_REQUESTS)),
@@ -713,7 +723,7 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
     }
     let headers = req.headers().clone();
     let path = req.uri().path().to_string();
-    let (principal, read_only) = match authenticate(&state, &headers, peer).await {
+    let (principal, mut read_only, grant) = match authenticate(&state, &headers, peer).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -724,6 +734,34 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
         Err(_) => return empty(StatusCode::PAYLOAD_TOO_LARGE),
     };
     let Some(t) = target(&path) else { return empty(StatusCode::NOT_FOUND) };
+    // Scoped tokens reach only the sections they were granted (an app with
+    // calendar access can't read contacts or files).
+    if let Some(scopes) = &grant {
+        use crate::auth::{dav_access, Access};
+        let sections = |t: &Target| -> Vec<String> {
+            match t {
+                Target::SectionRoot(s) => vec![s.clone()],
+                Target::Node(_, p) => vec![p.split('/').next().unwrap_or("").to_string()],
+                _ => vec![],
+            }
+        };
+        let mut secs = sections(&t);
+        if matches!(method.as_str(), "COPY" | "MOVE") {
+            if let Some(d) = headers.get("destination").and_then(|v| v.to_str().ok()).and_then(target) {
+                secs.extend(sections(&d));
+            }
+        }
+        let lvl = if secs.is_empty() {
+            // Root and principals: readable with any DAV access, never writable.
+            Access::Read
+        } else {
+            secs.iter().map(|s| dav_access(scopes, s)).min().unwrap_or(Access::None)
+        };
+        if lvl == Access::None {
+            return precondition(StatusCode::FORBIDDEN, DAV, "need-privileges");
+        }
+        read_only = read_only || lvl == Access::Read;
+    }
     let ctx = Ctx { state, principal, read_only, base };
     let writes = !matches!(method.as_str(), "GET" | "HEAD" | "PROPFIND" | "REPORT" | "OPTIONS");
     if writes && ctx.read_only {

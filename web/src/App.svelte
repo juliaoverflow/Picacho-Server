@@ -9,7 +9,6 @@
   import Login from './pages/Login.svelte';
   import Shell from './pages/Shell.svelte';
   import Me from './pages/Me.svelte';
-  import Consent from './pages/Consent.svelte';
   import { applyBranding } from './lib/brand.svelte.js';
 
   let phase = $state('loading');
@@ -45,10 +44,6 @@
 
   onMount(boot);
 
-  // OAuth consent pages keep their query string through sign-in.
-  const consent = location.pathname === '/oauth/authorize';
-  const next = location.pathname + location.search;
-
   function signedIn(me) {
     ui.me = me;
     phase = 'app';
@@ -63,9 +58,7 @@
 {:else if phase === 'setup'}
   <Setup onDone={signedIn} />
 {:else if phase === 'login'}
-  <Login onDone={signedIn} next={consent ? next : router.path} />
-{:else if consent}
-  <Consent />
+  <Login onDone={signedIn} next={router.path} />
 {:else if ui.me?.role === 'admin'}
   <Shell />
 {:else}

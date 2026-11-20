@@ -24,6 +24,7 @@ pub struct Discovery {
     pub token_endpoint: String,
     pub userinfo_endpoint: Option<String>,
     pub end_session_endpoint: Option<String>,
+    pub jwks_uri: Option<String>,
     pub basic_auth: bool,
 }
 
@@ -60,7 +61,7 @@ fn cache() -> &'static DashMap<String, (Discovery, Instant)> {
     C.get_or_init(DashMap::new)
 }
 
-fn http() -> reqwest::Client {
+pub(crate) fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
@@ -110,6 +111,7 @@ pub async fn discover(issuer: &str) -> Result<Discovery, String> {
         token_endpoint: token,
         userinfo_endpoint: s("userinfo_endpoint").filter(|u| allowed_url(u)),
         end_session_endpoint: s("end_session_endpoint"),
+        jwks_uri: s("jwks_uri").filter(|u| allowed_url(u)),
         basic_auth: methods.iter().any(|m| m == "client_secret_basic"),
     };
     cache().insert(issuer, (disc.clone(), Instant::now()));

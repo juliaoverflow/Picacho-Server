@@ -52,6 +52,7 @@ pub fn routes(state: State) -> Router {
         .route("/accounts", get(list_accounts).post(create_account))
         .route("/accounts/{id}", get(get_account).patch(update_account).delete(delete_account))
         .route("/accounts/{id}/password", post(set_account_password))
+        .route("/addresses/{address}", get(address_check))
         .route("/aliases", get(list_aliases).post(create_alias))
         .route("/aliases/{id}", axum::routing::patch(update_alias).delete(delete_alias))
         .route("/queue", get(list_queue))
@@ -75,12 +76,6 @@ pub fn routes(state: State) -> Router {
         .route("/api/oidc/test", post(oidc_test))
         .route("/api/auth/oidc/start", get(oidc_start))
         .route("/api/auth/oidc/callback", get(oidc_callback))
-        .route("/api/oauth/request", get(oauth_request))
-        .route("/api/oauth/approve", post(oauth_approve))
-        .route("/api/oauth/grants", get(oauth_grants))
-        .route("/api/oauth/grants/{family}", delete(oauth_revoke_grant))
-        .route("/api/admin/oauth/clients", get(oauth_clients).post(create_oauth_client))
-        .route("/api/admin/oauth/clients/{id}", delete(delete_oauth_client))
         .route("/api/setup/verify", post(setup_verify))
         .route("/api/setup/complete", post(setup_complete))
         .route("/api/auth/login", post(login))
@@ -241,6 +236,8 @@ async fn status(AxState(state): AxState<State>, headers: HeaderMap) -> R {
         "auth": {
             "password": crate::auth::web_password_allowed(&state),
             "oidc": if s.auth.oidc.enabled { json!({"name": s.auth.oidc.display_name}) } else { Value::Null },
+            // Apps get mailbox access from this identity provider.
+            "provider": if s.auth.oidc.access_tokens { json!({"name": s.auth.oidc.display_name, "issuer": s.auth.oidc.issuer.trim_end_matches('/')}) } else { Value::Null },
             "redirect_uri": redirect_uri(&state, &headers),
         },
         "branding": s.branding,
@@ -954,10 +951,45 @@ async fn list_accounts(AxState(state): AxState<State>, headers: HeaderMap) -> R 
     Ok(Json(json!(accounts)))
 }
 
+/// `issuer|sub` for a subject at the configured identity provider.
+fn oidc_link(state: &State, sub: &str) -> Result<String, ApiError> {
+    let issuer = state.settings().auth.oidc.issuer.trim().trim_end_matches('/').to_string();
+    if issuer.is_empty() {
+        return Err(bad("Configure the identity provider (auth.oidc.issuer) before linking identities."));
+    }
+    if sub.len() > 255 || sub.chars().any(|c| c.is_control() || c == '|') {
+        return Err(bad("That isn't a valid subject."));
+    }
+    Ok(format!("{issuer}|{sub}"))
+}
+
+/// Whether an address can be given to a new mailbox, and if not, why.
+async fn address_check(AxState(state): AxState<State>, headers: HeaderMap, Path(addr): Path<String>) -> R {
+    admin(&state, &headers).await?;
+    let Some(email) = normalize_address(&addr) else {
+        return Ok(Json(json!({"address": addr, "available": false, "reason": "invalid"})));
+    };
+    let reason = match state.db.domain_by_name(crate::util::domain_of(&email)).await? {
+        None => Some("domain"),
+        Some(d) if d.mode != "local" || !d.active => Some("domain"),
+        Some(_) if state.db.account_by_email(&email).await?.is_some() => Some("taken"),
+        Some(_) if state.db.alias_by_source(&email).await?.is_some() => Some("taken"),
+        Some(_) => None,
+    };
+    Ok(Json(json!({"address": email, "available": reason.is_none(), "reason": reason})))
+}
+
 #[derive(Deserialize)]
 struct NewAccount {
     email: String,
+    /// Optional when `oidc_subject` is given: the person signs in through
+    /// the identity provider and mail apps use its tokens or app passwords.
+    #[serde(default)]
     password: String,
+    /// The identity provider's `sub` for this person; links the account so
+    /// single sign-on and access tokens resolve to it.
+    #[serde(default)]
+    oidc_subject: Option<String>,
     #[serde(default)]
     display_name: String,
     #[serde(default)]
@@ -980,15 +1012,33 @@ async fn create_account(AxState(state): AxState<State>, headers: HeaderMap, Json
     if state.db.account_by_email(&email).await?.is_some() || state.db.alias_by_source(&email).await?.is_some() {
         return Err(bad("That address is already in use."));
     }
-    check_password_strength(&b.password, state.settings().security.password_min_length).map_err(bad)?;
+    let link = match b.oidc_subject.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        Some(sub) => Some(oidc_link(&state, sub)?),
+        None => None,
+    };
+    if let Some(k) = &link {
+        if state.db.account_by_oidc(k).await?.is_some() {
+            return Err(ApiError(StatusCode::CONFLICT, "That identity already has a mailbox.".into()));
+        }
+    }
+    if link.is_none() || !b.password.is_empty() {
+        check_password_strength(&b.password, state.settings().security.password_min_length).map_err(bad)?;
+    }
     let role = b.role.unwrap_or_else(|| "user".into());
     if role != "user" && role != "admin" {
         return Err(bad("Role must be user or admin."));
     }
     let quota = b.quota_mb.unwrap_or(state.settings().limits.default_quota_mb as i64).max(0) * 1024 * 1024;
-    let pw = b.password.clone();
-    let hash = tokio::task::spawn_blocking(move || hash_password(&pw)).await.map_err(|e| anyhow::anyhow!(e))??;
+    let hash = if b.password.is_empty() {
+        "!".to_string()
+    } else {
+        let pw = b.password.clone();
+        tokio::task::spawn_blocking(move || hash_password(&pw)).await.map_err(|e| anyhow::anyhow!(e))??
+    };
     let id = state.db.create_account(&email, dom.id, &hash, b.display_name.trim(), &role, quota).await?;
+    if let Some(k) = &link {
+        state.db.set_oidc_sub(id, k).await?;
+    }
     state.event("info", "admin", &format!("{} created account {email}", who.email));
     let a = state.db.get_account(id).await?.ok_or_else(not_found)?;
     Ok(Json(account_json(&a)))
@@ -1029,6 +1079,8 @@ struct AccountPatch {
     can_send_external: Option<bool>,
     forward_to: Option<String>,
     keep_copy: Option<bool>,
+    /// Link (or with "" unlink) the identity provider's `sub`.
+    oidc_subject: Option<String>,
 }
 
 async fn update_account(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>, Json(b): Json<AccountPatch>) -> R {
@@ -1068,6 +1120,21 @@ async fn update_account(AxState(state): AxState<State>, headers: HeaderMap, Path
     }
     if let Some(k) = b.keep_copy {
         a.keep_copy = k;
+    }
+    if let Some(sub) = b.oidc_subject {
+        let link = match sub.trim() {
+            "" => String::new(),
+            sub => oidc_link(&state, sub)?,
+        };
+        if !link.is_empty() {
+            if let Some(other) = state.db.account_by_oidc(&link).await? {
+                if other.id != a.id {
+                    return Err(ApiError(StatusCode::CONFLICT, "That identity is linked to another mailbox.".into()));
+                }
+            }
+        }
+        state.db.set_oidc_sub(a.id, &link).await?;
+        a.oidc_sub = link;
     }
     state.db.update_account(&a).await?;
     state.event("info", "admin", &format!("{} updated account {}", who.email, a.email));
@@ -1513,126 +1580,6 @@ async fn restart(AxState(state): AxState<State>, headers: HeaderMap) -> R {
 
 // ------------------------------------------------------------- OAuth consent
 
-fn level_name(a: crate::auth::Access) -> &'static str {
-    match a {
-        crate::auth::Access::Write => "write",
-        crate::auth::Access::Read => "read",
-        crate::auth::Access::None => "none",
-    }
-}
-
-fn level_from(s: &str) -> crate::auth::Access {
-    match s {
-        "write" => crate::auth::Access::Write,
-        "read" => crate::auth::Access::Read,
-        _ => crate::auth::Access::None,
-    }
-}
-
-/// Validate an authorization request for the consent screen.
-async fn oauth_request(AxState(state): AxState<State>, headers: HeaderMap, Query(q): Query<std::collections::HashMap<String, String>>) -> R {
-    let signed_in = current(&state, &headers).await.ok();
-    match crate::oauth::validate_request(&state, &q).await {
-        Ok(req) => {
-            let host = url::Url::parse(&req.redirect_uri).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_else(|| req.redirect_uri.clone());
-            Ok(Json(json!({
-                "client": {"name": req.client.name, "client_id": req.client.client_id, "dynamic": req.client.dynamic},
-                "redirect_host": host,
-                "requested": req.requested.iter().map(|(k, v)| (k.to_string(), level_name(*v))).collect::<std::collections::HashMap<_, _>>(),
-                "account": signed_in.map(|a| json!({"email": a.email, "display_name": a.display_name})),
-            })))
-        }
-        Err(crate::oauth::RequestError::Fatal(m)) => Ok(Json(json!({"fatal": m}))),
-        Err(crate::oauth::RequestError::Redirect(u)) => Ok(Json(json!({"redirect": u}))),
-    }
-}
-
-#[derive(Deserialize)]
-struct Approve {
-    params: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    grant: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    deny: bool,
-}
-
-async fn oauth_approve(AxState(state): AxState<State>, headers: HeaderMap, Json(b): Json<Approve>) -> R {
-    if bearer(&headers).is_some() {
-        return Err(forbidden());
-    }
-    let me = current(&state, &headers).await?;
-    let req = match crate::oauth::validate_request(&state, &b.params).await {
-        Ok(r) => r,
-        Err(crate::oauth::RequestError::Fatal(m)) => return Err(bad(m)),
-        Err(crate::oauth::RequestError::Redirect(u)) => return Ok(Json(json!({"redirect": u}))),
-    };
-    if b.deny {
-        let u = crate::oauth::error_redirect(&req.redirect_uri, "access_denied", "The person declined.", req.state.as_deref());
-        return Ok(Json(json!({"redirect": u})));
-    }
-    let mut levels = std::collections::HashMap::new();
-    for svc in crate::oauth::SERVICES {
-        let want = level_from(b.grant.get(svc).map(String::as_str).unwrap_or("none"));
-        levels.insert(svc, want.min(req.requested[svc]));
-    }
-    let scopes = crate::oauth::scope_string(&levels);
-    if scopes.is_empty() {
-        return Err(bad("Allow at least one kind of access, or choose Deny."));
-    }
-    let url = crate::oauth::issue_code(&state, &req, me.id, &scopes).await?;
-    state.event("info", "auth", &format!("{} authorized '{}' ({scopes})", me.email, req.client.name));
-    Ok(Json(json!({"redirect": url})))
-}
-
-async fn oauth_grants(AxState(state): AxState<State>, headers: HeaderMap, Query(q): Query<TokenQuery>) -> R {
-    let me = current(&state, &headers).await?;
-    let all = q.all.unwrap_or(false) && me.is_admin();
-    Ok(Json(json!(state.db.oauth_grants(if all { None } else { Some(me.id) }).await?)))
-}
-
-async fn oauth_revoke_grant(AxState(state): AxState<State>, headers: HeaderMap, Path(family): Path<String>) -> R {
-    let me = current(&state, &headers).await?;
-    let scope = if me.is_admin() { None } else { Some(me.id) };
-    if !state.db.revoke_oauth_family(&family, scope).await? {
-        return Err(not_found());
-    }
-    state.event("info", "auth", &format!("{} revoked an app's access", me.email));
-    Ok(Json(json!({"ok": true})))
-}
-
-async fn oauth_clients(AxState(state): AxState<State>, headers: HeaderMap) -> R {
-    admin(&state, &headers).await?;
-    Ok(Json(json!(state.db.list_oauth_clients().await?)))
-}
-
-#[derive(Deserialize)]
-struct NewClient {
-    name: String,
-    redirect_uris: Vec<String>,
-    #[serde(default)]
-    confidential: bool,
-    #[serde(default)]
-    scopes: Vec<String>,
-}
-
-async fn create_oauth_client(AxState(state): AxState<State>, headers: HeaderMap, Json(b): Json<NewClient>) -> R {
-    let who = admin(&state, &headers).await?;
-    let uris: Vec<String> = b.redirect_uris.iter().map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
-    let (client, secret) = crate::oauth::create_client(&state, &b.name, uris, &b.scopes.join(" "), b.confidential, false).await.map_err(bad)?;
-    state.event("info", "admin", &format!("{} registered OAuth client '{}'", who.email, client.name));
-    Ok(Json(json!({"client": client, "client_secret": secret})))
-}
-
-async fn delete_oauth_client(AxState(state): AxState<State>, headers: HeaderMap, Path(id): Path<String>) -> R {
-    let who = admin(&state, &headers).await?;
-    if !state.db.delete_oauth_client(&id).await? {
-        return Err(not_found());
-    }
-    state.event("warn", "admin", &format!("{} removed OAuth client {id} and its tokens", who.email));
-    Ok(Json(json!({"ok": true})))
-}
-
-
 // ============================================================= audit
 
 /// Record every successful state-changing admin or account API call.
@@ -1653,7 +1600,7 @@ async fn audit_mw(
         let actor = match current(&state, &headers).await {
             Ok(a) => a.email,
             Err(_) => match bearer(&headers) {
-                Some(t) => crate::auth::bearer_principal(&state, t).await.map(|p| format!("{} (oauth)", p.account.email)).unwrap_or_else(|| "token".into()),
+                Some(t) => crate::auth::bearer_principal(&state, t).await.map(|p| format!("{} ({})", p.account.email, if p.external { "app" } else { "token" })).unwrap_or_else(|| "token".into()),
                 None => "anonymous".into(),
             },
         };
@@ -1679,8 +1626,6 @@ fn ext_admin_routes() -> Router<State> {
         .route("/relay/peers/{name}", axum::routing::patch(update_peer).delete(delete_peer))
         .route("/dav/principals", get(list_principals).post(create_principal))
         .route("/dav/principals/{name}", get(get_principal).patch(update_principal).delete(delete_principal))
-        .route("/accounts/{id}/authorizations", get(list_authorizations).post(create_authorization))
-        .route("/accounts/{id}/authorizations/{family}", delete(revoke_authorization))
         .route("/accounts/{id}/sieve", get(admin_list_sieve))
         .route("/accounts/{id}/sieve/{name}", get(admin_get_sieve).put(admin_put_sieve).delete(admin_delete_sieve))
         .route("/accounts/{id}/sieve/{name}/activate", post(admin_activate_sieve))
@@ -1706,11 +1651,8 @@ async fn server_info(AxState(state): AxState<State>, headers: HeaderMap) -> R {
         "managesieve": addrs(&l.managesieve),
         "jmap": {"session": format!("{base}/.well-known/jmap"), "api": format!("{base}/jmap/api")},
         "dav": {"root": format!("{base}/dav/"), "caldav": format!("{base}/.well-known/caldav"), "carddav": format!("{base}/.well-known/carddav")},
-        "oauth": {
-            "metadata": format!("{base}/.well-known/oauth-authorization-server"),
-            "token": format!("{base}/oauth/token"),
-            "scopes": crate::oauth::SCOPES,
-        },
+        "oauth_resource": crate::resource::metadata(&state).map(|_| format!("{base}/.well-known/oauth-protected-resource")),
+        "rest_api": format!("{base}/v1"),
         "account_api": format!("{base}/api/v1/me"),
         "admin_api": format!("{base}/api/v1"),
         "discovery": format!("{base}/.well-known/picacho"),
@@ -2028,45 +1970,6 @@ async fn admin_account_dav(AxState(state): AxState<State>, headers: HeaderMap, P
     Ok(Json(json!(state.db.dav_principal_for_account(acc.id).await?)))
 }
 
-// ---------------------------------------------------------------- authorizations
-
-#[derive(Deserialize)]
-struct NewAuthorization {
-    /// Space-separated scopes, e.g. "imap jmap smtp account".
-    scope: String,
-    /// Registered OAuth client the tokens belong to (default: a built-in public client).
-    client_id: Option<String>,
-}
-
-/// Issue OAuth tokens for an account without a consent screen: how an
-/// identity provider or control panel gets mail, DAV and account access
-/// on someone's behalf.
-async fn create_authorization(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>, Json(b): Json<NewAuthorization>) -> R {
-    let who = admin(&state, &headers).await?;
-    let acc = resolve_account(&state, &key).await?;
-    if !acc.active {
-        return Err(bad("The account is disabled."));
-    }
-    let v = crate::oauth::admin_authorize(&state, acc.id, b.client_id.as_deref(), &b.scope).await.map_err(bad)?;
-    state.event("info", "auth", &format!("{} issued an authorization for {} ({})", who.email, acc.email, v["scope"].as_str().unwrap_or("")));
-    Ok(Json(v))
-}
-
-async fn list_authorizations(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>) -> R {
-    admin(&state, &headers).await?;
-    let acc = resolve_account(&state, &key).await?;
-    Ok(Json(json!(state.db.oauth_grants(Some(acc.id)).await?)))
-}
-
-async fn revoke_authorization(AxState(state): AxState<State>, headers: HeaderMap, Path((key, family)): Path<(String, String)>) -> R {
-    admin(&state, &headers).await?;
-    let acc = resolve_account(&state, &key).await?;
-    if !state.db.revoke_oauth_family(&family, Some(acc.id)).await? {
-        return Err(not_found());
-    }
-    Ok(Json(json!({"ok": true})))
-}
-
 // ---------------------------------------------------------------- sieve & vacation (shared by admin and /me)
 
 async fn sieve_list(state: &State, acc: i64) -> R {
@@ -2240,13 +2143,23 @@ async fn migration_status(AxState(state): AxState<State>, headers: HeaderMap, Pa
 /// with the `account` scope, or an OAuth token with `account` /
 /// `account:read`. Writes need write access.
 async fn me_account(state: &State, headers: &HeaderMap, write: bool) -> Result<Account, ApiError> {
+    me_account_for(state, headers, write, true).await
+}
+
+/// Like `me_account`, but `external: false` refuses access tokens from the
+/// identity provider: apps may change settings, but not mint app passwords,
+/// export the whole mailbox or start migrations.
+async fn me_account_for(state: &State, headers: &HeaderMap, write: bool, external: bool) -> Result<Account, ApiError> {
     if let Some(t) = bearer(headers) {
         let p = crate::auth::bearer_principal(state, t).await.ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Invalid or expired token.".into()))?;
         let lvl = crate::auth::access(&p.scopes, crate::auth::Service::Account);
-        let admin_token = !p.oauth && p.scopes.split([',', ' ']).any(|s| s == "admin");
+        let admin_token = !p.external && p.scopes.split([',', ' ']).any(|s| s == "admin");
         let need = if write { crate::auth::Access::Write } else { crate::auth::Access::Read };
         if lvl < need && !admin_token {
             return Err(ApiError(StatusCode::FORBIDDEN, "This token lacks the account scope.".into()));
+        }
+        if p.external && !external {
+            return Err(ApiError(StatusCode::FORBIDDEN, "Apps can't do this. Sign in to the console instead.".into()));
         }
         return Ok(p.account);
     }
@@ -2345,7 +2258,7 @@ async fn me_put_vacation(AxState(state): AxState<State>, headers: HeaderMap, Jso
 }
 
 async fn me_list_tokens(AxState(state): AxState<State>, headers: HeaderMap) -> R {
-    let a = me_account(&state, &headers, false).await?;
+    let a = me_account_for(&state, &headers, false, false).await?;
     Ok(Json(json!(state.db.list_tokens(Some(a.id)).await?)))
 }
 
@@ -2359,7 +2272,7 @@ struct MeToken {
 }
 
 async fn me_create_token(AxState(state): AxState<State>, headers: HeaderMap, Json(b): Json<MeToken>) -> R {
-    let a = me_account(&state, &headers, true).await?;
+    let a = me_account_for(&state, &headers, true, false).await?;
     let scopes: Vec<String> = if b.scopes.is_empty() { vec!["mail".into(), "jmap".into(), "dav".into(), "sieve".into()] } else { b.scopes.clone() };
     for s in &scopes {
         if !crate::auth::VALID_SCOPES.contains(&s.as_str()) || s == "admin" {
@@ -2376,7 +2289,7 @@ async fn me_create_token(AxState(state): AxState<State>, headers: HeaderMap, Jso
 }
 
 async fn me_delete_token(AxState(state): AxState<State>, headers: HeaderMap, Path(id): Path<i64>) -> R {
-    let a = me_account(&state, &headers, true).await?;
+    let a = me_account_for(&state, &headers, true, false).await?;
     if !state.db.delete_token(id, Some(a.id)).await? {
         return Err(not_found());
     }
@@ -2384,7 +2297,7 @@ async fn me_delete_token(AxState(state): AxState<State>, headers: HeaderMap, Pat
 }
 
 async fn me_dav(AxState(state): AxState<State>, headers: HeaderMap) -> R {
-    let a = me_account(&state, &headers, false).await?;
+    let a = me_account_for(&state, &headers, false, false).await?;
     let p = crate::dav::principal_for_account(&state, &a).await?;
     let base = crate::jmap::base_url(&state, &headers);
     Ok(Json(json!({
@@ -2400,7 +2313,7 @@ struct DavPassword {
 }
 
 async fn me_dav_password(AxState(state): AxState<State>, headers: HeaderMap, Json(b): Json<DavPassword>) -> R {
-    let a = me_account(&state, &headers, true).await?;
+    let a = me_account_for(&state, &headers, true, false).await?;
     let mut p = crate::dav::principal_for_account(&state, &a).await?.ok_or_else(|| bad("Calendars and contacts aren't enabled for this account."))?;
     p.password_hash = match &b.password {
         Some(pw) => hash_pw(&state, pw).await?,
@@ -2411,12 +2324,12 @@ async fn me_dav_password(AxState(state): AxState<State>, headers: HeaderMap, Jso
 }
 
 async fn me_export(AxState(state): AxState<State>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let a = me_account(&state, &headers, false).await?;
+    let a = me_account_for(&state, &headers, false, false).await?;
     export_response(&state, &a).await
 }
 
 async fn me_migrate(AxState(state): AxState<State>, headers: HeaderMap, Json(b): Json<crate::ops::MigrateRequest>) -> R {
-    let a = me_account(&state, &headers, true).await?;
+    let a = me_account_for(&state, &headers, true, false).await?;
     Ok(Json(json!({"id": crate::ops::start_migration(&state, a.id, b)})))
 }
 
