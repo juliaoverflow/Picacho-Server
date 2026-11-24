@@ -12,6 +12,7 @@
 //! user name is the address) or standalone (its own user name and
 //! password). Files, calendars and contacts each have their own store
 //! (`[storage.dav]`), defaulting to the message store's backend.
+pub mod attach;
 pub mod ical;
 pub mod jscal;
 mod directory;
@@ -713,7 +714,7 @@ pub const ALLOW: &str = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, M
 fn options() -> Response {
     let mut r = empty(StatusCode::OK);
     let h = r.headers_mut();
-    h.insert("DAV", HeaderValue::from_static("1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol"));
+    h.insert("DAV", HeaderValue::from_static("1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol, calendar-managed-attachments"));
     h.insert(header::ALLOW, HeaderValue::from_static(ALLOW));
     h.insert("MS-Author-Via", HeaderValue::from_static("DAV"));
     r
@@ -730,6 +731,7 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
     }
     let headers = req.headers().clone();
     let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
     let (principal, mut read_only, grant) = match authenticate(&state, &headers, peer).await {
         Ok(p) => p,
         Err(r) => return r,
@@ -777,6 +779,25 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
     if let Err(e) = ensure_homes(&ctx.state, &ctx.principal).await {
         tracing::warn!("dav homes: {e:#}");
     }
+    // A managed attachment can be read by anyone signed in here (its name
+    // is random): the event's other attendees follow its link.
+    if let Target::Node(u, p) = &t {
+        if u != &ctx.principal.username && matches!(method.as_str(), "GET" | "HEAD") && attach::touches(p) && p != attach::COLLECTION {
+            let Ok(Some(owner)) = ctx.state.db.dav_principal(u).await else { return empty(StatusCode::NOT_FOUND) };
+            let octx = Ctx { state: ctx.state.clone(), principal: owner, read_only: true, base: ctx.base.clone() };
+            return match get(&octx, &t, &headers, method == Method::HEAD).await {
+                Ok(r) => r,
+                Err(_) => empty(StatusCode::INTERNAL_SERVER_ERROR),
+            };
+        }
+    }
+    // Attachment files change only through their events (RFC 8607).
+    if writes && !matches!(method.as_str(), "POST" | "LOCK" | "UNLOCK") {
+        let dest = headers.get("destination").and_then(|v| v.to_str().ok()).and_then(target);
+        if [Some(&t), dest.as_ref()].into_iter().flatten().any(|x| matches!(x, Target::Node(_, p) if attach::touches(p))) {
+            return precondition(StatusCode::FORBIDDEN, DAV, "need-privileges");
+        }
+    }
     // Only one's own data is reachable.
     if let Target::Node(u, _) | Target::Principal(u) = &t {
         if u != &ctx.principal.username {
@@ -800,6 +821,10 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
         "MKCALENDAR" => mkcol(&ctx, &t, &headers, &body, true).await,
         "COPY" | "MOVE" => copy_move(&ctx, &t, &headers, method.as_str() == "MOVE").await,
         "POST" if matches!(&t, Target::Node(_, p) if p == schedule::OUTBOX) => schedule::outbox_post(&ctx, &headers, &body).await,
+        "POST" if query.contains("action=attachment-") => match &t {
+            Target::Node(u, p) => attach::post(&ctx, u, p, &query, &headers, &body).await,
+            _ => Ok(empty(StatusCode::NOT_FOUND)),
+        },
         "POST" => Ok(empty(StatusCode::METHOD_NOT_ALLOWED)),
         _ => Ok(empty(StatusCode::METHOD_NOT_ALLOWED)),
     };
@@ -871,6 +896,9 @@ pub mod store {
         }
         let ctx = Ctx { state: state.clone(), principal: p.clone(), read_only: false, base: String::new() };
         remove_tree(&ctx, path).await?;
+        if n.section() == "calendars" {
+            attach::sweep(&ctx).await?;
+        }
         Ok(true)
     }
 
@@ -1024,6 +1052,7 @@ async fn get(ctx: &Ctx, t: &Target, h: &HeaderMap, head: bool) -> Result<Respons
     if let Some(d) = chrono::DateTime::from_timestamp(n.updated_at, 0) {
         hd.insert(header::LAST_MODIFIED, HeaderValue::from_str(&d.format("%a, %d %b %Y %H:%M:%S GMT").to_string())?);
     }
+    attach::decorate(&n, &mut r);
     Ok(r)
 }
 
@@ -1180,6 +1209,9 @@ async fn put(ctx: &Ctx, t: &Target, h: &HeaderMap, body: Bytes) -> Result<Respon
     }
     st.db.dav_usage(pid, body.len() as i64 - old_size).await?;
     record_change(st, pid, path, false).await;
+    if existing.is_some() && parent.is_calendar() {
+        attach::sweep(ctx).await?;
+    }
     let mut r = empty(if existing.is_some() { StatusCode::NO_CONTENT } else { StatusCode::CREATED });
     r.headers_mut().insert(header::ETAG, HeaderValue::from_str(&etag)?);
     Ok(r)
@@ -1286,6 +1318,9 @@ async fn delete(ctx: &Ctx, t: &Target, h: &HeaderMap) -> Result<Response> {
         return Ok(r);
     }
     remove_tree(ctx, path).await?;
+    if n.section() == "calendars" && !attach::touches(path) {
+        attach::sweep(ctx).await?;
+    }
     Ok(empty(StatusCode::NO_CONTENT))
 }
 

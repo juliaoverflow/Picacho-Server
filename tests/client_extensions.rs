@@ -860,6 +860,97 @@ async fn caldav_free_busy_through_the_scheduling_outbox() {
     assert!(!body.contains("2.0;Success"), "{body}");
 }
 
+#[tokio::test]
+async fn caldav_managed_attachments() {
+    let s = server().await;
+    let c = reqwest::Client::new();
+    let base = format!("http://{}", s.web);
+    let ev = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:att-1\r\nDTSTAMP:20261101T000000Z\r\nDTSTART:20261201T100000Z\r\nDTEND:20261201T110000Z\r\nSUMMARY:Review\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let href = "/dav/calendars/bob@example.test/default/att-1.ics";
+    let (st, _) = dav(&s, "bob@example.test", "PUT", href, "text/calendar", ev).await;
+    assert_eq!(st, 201);
+    // What the app checks first (sync/dav.rs `manages_attachments`, `attachment_limits`).
+    let r = c.request(reqwest::Method::OPTIONS, format!("{base}/dav/calendars/bob@example.test/default/")).send().await.unwrap();
+    assert!(r.headers()["dav"].to_str().unwrap().contains("calendar-managed-attachments"));
+    let (_, body) = dav(&s, "bob@example.test", "PROPFIND", "/dav/calendars/bob@example.test/default/", "application/xml",
+        "<propfind xmlns=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><prop><C:max-attachment-size/><C:max-attachments-per-resource/></prop></propfind>").await;
+    assert!(body.contains("max-attachment-size>") && body.contains("max-attachments-per-resource>20<"), "{body}");
+
+    let etag = |r: &reqwest::Response| r.headers().get("etag").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+    let (_, before) = dav(&s, "bob@example.test", "GET", href, "", "").await;
+    let current = c.get(format!("{base}{href}")).basic_auth("bob@example.test", Some("Correct-Horse-9")).send().await.unwrap();
+    let tag = etag(&current);
+    assert!(!before.contains("ATTACH"));
+    // Add, as the app sends it.
+    let r = c
+        .post(format!("{base}{href}?action=attachment-add"))
+        .basic_auth("bob@example.test", Some("Correct-Horse-9"))
+        .header("content-type", "application/pdf")
+        .header("content-disposition", "attachment;filename=\"plan.pdf\";filename*=UTF-8''pl%C3%A4n.pdf")
+        .header("if-match", &tag)
+        .body("%PDF-1.4 hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let id = r.headers()["cal-managed-id"].to_str().unwrap().to_string();
+    let tag = etag(&r);
+    let (_, ics) = dav(&s, "bob@example.test", "GET", href, "", "").await;
+    let unfolded = ics.replace("\r\n ", "");
+    assert!(unfolded.contains(&format!("MANAGED-ID={id}")) && unfolded.contains("FILENAME=plän.pdf") && unfolded.contains("SIZE=14") && unfolded.contains("FMTTYPE=application/pdf"), "{ics}");
+    let url = unfolded.lines().find(|l| l.starts_with("ATTACH")).unwrap().rsplit_once(':').map(|x| x.1).unwrap();
+    let url = format!("{base}{}", &url[url.find("/dav/").unwrap()..]);
+    // The file, for the owner and for a guest signed in here; nobody else.
+    for user in ["bob@example.test", "amy@example.test"] {
+        let r = c.get(&url).basic_auth(user, Some("Correct-Horse-9")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{user}");
+        assert!(r.headers()["content-disposition"].to_str().unwrap().contains("pl%C3%A4n.pdf"));
+        assert_eq!(r.text().await.unwrap(), "%PDF-1.4 hello");
+    }
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 401);
+    // Clients can't write the files directly.
+    let (st, _) = dav(&s, "bob@example.test", "PUT", &url[url.find("/dav/").unwrap()..], "application/pdf", "x").await;
+    assert_eq!(st, 403);
+    // A stale ETag is refused; an unknown id too.
+    let r = c.post(format!("{base}{href}?action=attachment-remove&managed-id={id}")).basic_auth("bob@example.test", Some("Correct-Horse-9")).header("if-match", "\"old\"").send().await.unwrap();
+    assert_eq!(r.status(), 412);
+    let r = c.post(format!("{base}{href}?action=attachment-remove&managed-id=nope")).basic_auth("bob@example.test", Some("Correct-Horse-9")).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    assert!(r.text().await.unwrap().contains("valid-managed-id"));
+    // Update replaces the file and its id; then remove takes it off and away.
+    let r = c
+        .post(format!("{base}{href}?action=attachment-update&managed-id={id}"))
+        .basic_auth("bob@example.test", Some("Correct-Horse-9"))
+        .header("content-type", "text/plain")
+        .header("content-disposition", "attachment;filename=\"notes.txt\"")
+        .header("if-match", &tag)
+        .body("v2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let id2 = r.headers()["cal-managed-id"].to_str().unwrap().to_string();
+    assert_ne!(id, id2);
+    assert_eq!(c.get(&url).basic_auth("bob@example.test", Some("Correct-Horse-9")).send().await.unwrap().status(), 404, "the old file is gone");
+    let r = c.post(format!("{base}{href}?action=attachment-remove&managed-id={id2}")).basic_auth("bob@example.test", Some("Correct-Horse-9")).send().await.unwrap();
+    assert_eq!(r.status(), 204);
+    let (_, ics) = dav(&s, "bob@example.test", "GET", href, "", "").await;
+    assert!(!ics.contains("ATTACH"), "{ics}");
+    let (_, list) = dav(&s, "bob@example.test", "PROPFIND", "/dav/calendars/bob@example.test/attachments/", "application/xml", "<propfind xmlns=\"DAV:\"><prop><getetag/></prop></propfind>").await;
+    assert!(!list.contains(&id2), "{list}");
+
+    // Deleting the event takes its files along; an unknown occurrence is refused.
+    let r = c.post(format!("{base}{href}?action=attachment-add")).basic_auth("bob@example.test", Some("Correct-Horse-9")).body("x").send().await.unwrap();
+    let id3 = r.headers()["cal-managed-id"].to_str().unwrap().to_string();
+    let r = c.post(format!("{base}{href}?action=attachment-add&rid=20261202T100000Z")).basic_auth("bob@example.test", Some("Correct-Horse-9")).body("x").send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    assert!(r.text().await.unwrap().contains("valid-rid"));
+    let (st, _) = dav(&s, "bob@example.test", "DELETE", href, "", "").await;
+    assert_eq!(st, 204);
+    let r = c.get(format!("{base}/dav/calendars/bob@example.test/attachments/{id3}")).basic_auth("bob@example.test", Some("Correct-Horse-9")).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+}
+
 // ------------------------------------------------------------ POP3
 
 struct Pop {

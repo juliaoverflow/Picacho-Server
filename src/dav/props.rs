@@ -78,7 +78,7 @@ fn writable(ns: &str, name: &str) -> Option<&'static str> {
 
 fn protected(ns: &str, name: &str) -> bool {
     LIVE.iter().any(|(n, x)| *n == ns && *x == name && name != "displayname")
-        || matches!((ns, name), (CALDAV, "supported-calendar-component-set") | (CALDAV, "supported-calendar-data") | (CALDAV, "max-resource-size") | (CARDDAV, "supported-address-data") | (CARDDAV, "max-resource-size") | (CALDAV, "calendar-home-set") | (CARDDAV, "addressbook-home-set") | (DAV, "principal-URL") | (CALDAV, "schedule-outbox-URL"))
+        || matches!((ns, name), (CALDAV, "supported-calendar-component-set") | (CALDAV, "supported-calendar-data") | (CALDAV, "max-resource-size") | (CARDDAV, "supported-address-data") | (CARDDAV, "max-resource-size") | (CALDAV, "calendar-home-set") | (CARDDAV, "addressbook-home-set") | (DAV, "principal-URL") | (CALDAV, "schedule-outbox-URL") | (CALDAV, "max-attachment-size") | (CALDAV, "max-attachments-per-resource"))
 }
 
 fn dead_key(ns: &str, name: &str) -> String {
@@ -407,6 +407,14 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
                     w.close(CARDDAV, "address-data-type");
                 }
                 w.close(CARDDAV, name);
+            }
+            _ => return false,
+        },
+        // RFC 8607 6: managed attachment limits, on calendars and the home.
+        (CALDAV, "max-attachment-size") | (CALDAV, "max-attachments-per-resource") => match node {
+            Some(n) if n.is_calendar() || n.kind == "calendar-home" => {
+                let v = if name == "max-attachment-size" { attach::max_size(st) } else { attach::MAX_PER_RESOURCE as u64 };
+                w.text_el(CALDAV, name, &v.to_string());
             }
             _ => return false,
         },
