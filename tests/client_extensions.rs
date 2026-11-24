@@ -322,6 +322,8 @@ impl Jmap {
             "urn:ietf:params:jmap:calendars",
             "urn:ietf:params:jmap:contacts",
             "urn:ietf:params:jmap:principals",
+            // The app names this whenever it asks for free/busy (sync/jmap.rs).
+            "urn:ietf:params:jmap:principals:availability",
         ];
         let r: serde_json::Value = self
             .c
@@ -1052,9 +1054,12 @@ async fn jmap_calendars_and_contacts_share_the_dav_store() {
     use serde_json::json;
     let s = server().await;
     let (bob, session) = Jmap::new(&s, "bob@example.test").await;
-    for cap in ["calendars", "contacts", "principals"] {
+    for cap in ["calendars", "contacts", "principals", "principals:availability"] {
         assert!(session["capabilities"][format!("urn:ietf:params:jmap:{cap}")].is_object(), "{cap}");
     }
+    let caps = &session["accounts"][&bob.account]["accountCapabilities"];
+    assert_eq!(caps["urn:ietf:params:jmap:principals:availability"]["maxAvailabilityDuration"], "P370D");
+    assert_eq!(caps["urn:ietf:params:jmap:blob"]["supportedTypeNames"], json!(["Email", "Thread", "Mailbox"]));
     // The default calendar, as the app lists it.
     let cals = bob.one("Calendar/get", json!({"ids": null})).await;
     let cal = cals["list"][0]["id"].as_str().unwrap().to_string();

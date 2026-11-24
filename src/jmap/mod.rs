@@ -39,8 +39,11 @@ pub const WEBSOCKET: &str = "urn:ietf:params:jmap:websocket";
 pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
 pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
 pub const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
+/// RFC 9670 section 2.2: Principal/getAvailability.
+pub const PRINCIPALS_AVAILABILITY: &str = "urn:ietf:params:jmap:principals:availability";
 /// Capabilities a request may name in `using`.
-const KNOWN: [&str; 12] = [CORE, MAIL, SUBMISSION, QUOTA, VACATION, SIEVE, BLOB, MDN, WEBSOCKET, CALENDARS, CONTACTS, PRINCIPALS];
+const KNOWN: [&str; 13] =
+    [CORE, MAIL, SUBMISSION, QUOTA, VACATION, SIEVE, BLOB, MDN, WEBSOCKET, CALENDARS, CONTACTS, PRINCIPALS, PRINCIPALS_AVAILABILITY];
 const MAX_CALLS: usize = 64;
 const MAX_REQUEST: usize = 10 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 1000;
@@ -192,6 +195,7 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
             CALENDARS: {},
             CONTACTS: {},
             PRINCIPALS: {},
+            PRINCIPALS_AVAILABILITY: {},
         },
         "accounts": {
             id.clone(): {
@@ -213,7 +217,7 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
                     BLOB: {
                         "maxSizeBlobSet": max_upload,
                         "maxDataSources": blob::MAX_DATA_SOURCES,
-                        "supportedTypeNames": ["Email", "Thread"],
+                        "supportedTypeNames": ["Email", "Thread", "Mailbox"],
                         "supportedDigestAlgorithms": ["sha", "sha-256"],
                     },
                     MDN: {},
@@ -221,6 +225,8 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
                         "maxExpandedQueryDuration": "P400D", "maxParticipantsPerEvent": 1000, "mayCreateCalendar": true},
                     CONTACTS: {"maxAddressBooksPerCard": 1, "mayCreateAddressBook": true},
                     PRINCIPALS: {"currentUserPrincipalId": format!("P{}", a.id)},
+                    // Principal/getAvailability takes at most 370 days.
+                    PRINCIPALS_AVAILABILITY: {"maxAvailabilityDuration": "P370D"},
                     SIEVE: {
                         "maxSizeScriptName": 128,
                         "maxSizeScript": crate::sieve::MAX_SCRIPT_BYTES,
@@ -233,7 +239,7 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
                 },
             },
         },
-        "primaryAccounts": {MAIL: id, SUBMISSION: id, QUOTA: id, CORE: id, VACATION: id, SIEVE: id, BLOB: id, MDN: id, CALENDARS: id, CONTACTS: id, PRINCIPALS: id},
+        "primaryAccounts": {MAIL: id, SUBMISSION: id, QUOTA: id, CORE: id, VACATION: id, SIEVE: id, BLOB: id, MDN: id, CALENDARS: id, CONTACTS: id, PRINCIPALS: id, PRINCIPALS_AVAILABILITY: id},
         "username": a.email,
         "apiUrl": format!("{base}/jmap/api"),
         "downloadUrl": format!("{base}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
