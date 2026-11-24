@@ -11,7 +11,7 @@
   let password = $state('');
   let busy = $state(false);
   let error = $state(new URLSearchParams(location.search).get('error') ?? '');
-  const auth = $derived(ui.status?.auth ?? { password: true, oidc: null });
+  const auth = $derived(ui.status?.auth ?? { password: true, oidc: null, ldap: null });
   let showPassword = $state(false);
 
   async function submit(e) {
@@ -44,11 +44,15 @@
     {/if}
     {#if auth.password}
       {#if auth.oidc && !showPassword}
-        <button class="link" onclick={() => (showPassword = true)}>Sign in with email and password</button>
+        <button class="link" onclick={() => (showPassword = true)}>{auth.ldap ? `Sign in with your ${auth.ldap.name} account` : 'Sign in with email and password'}</button>
       {:else}
         {#if auth.oidc}<div class="or"><span>or</span></div>{/if}
         <form onsubmit={submit}>
-          <label class="field"><span>Email</span><input class="input" type="email" bind:value={email} autocomplete="username" required autofocus /></label>
+          {#if auth.ldap}
+            <label class="field"><span>Email or {auth.ldap.name} user name</span><input class="input" type="text" bind:value={email} autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus /></label>
+          {:else}
+            <label class="field"><span>Email</span><input class="input" type="email" bind:value={email} autocomplete="username" required autofocus /></label>
+          {/if}
           <label class="field"><span>Password</span><input class="input" type="password" bind:value={password} autocomplete="current-password" required /></label>
           <button class="btn big" class:primary={!auth.oidc} disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
         </form>

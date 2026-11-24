@@ -167,6 +167,7 @@ async fn process(state: &State, item: QueueItem) -> anyhow::Result<()> {
                 RcptOutcome::Sent { relayed } => {
                     crate::metrics::DELIVERED.inc();
                     state.event("info", "delivery", &format!("queue {}: delivered to {r}", item.id));
+                    crate::submit::queue_outcome(state, item.submission_id, &r, true, if relayed { "250 2.0.0 Relayed" } else { "" }).await;
                     delivered.push((r, relayed));
                 }
                 RcptOutcome::Temporary(e) => {
@@ -175,6 +176,7 @@ async fn process(state: &State, item: QueueItem) -> anyhow::Result<()> {
                 }
                 RcptOutcome::Permanent(e) => {
                     crate::metrics::BOUNCED.inc();
+                    crate::submit::queue_outcome(state, item.submission_id, &r, false, &e).await;
                     last_error = e.clone();
                     failed.push((r, e));
                 }
@@ -182,6 +184,13 @@ async fn process(state: &State, item: QueueItem) -> anyhow::Result<()> {
         }
     }
     let age_hours = (now() - item.created_at) / 3600;
+    // DELIVERBY with R: not delivered in time is returned (RFC 2852 4.1).
+    if !remaining.is_empty() && dsn.by.is_some_and(|by| now() >= by) && dsn.by_mode != "N" {
+        for r in remaining.drain(..) {
+            crate::submit::queue_outcome(state, item.submission_id, &r, false, "5.4.7 Delivery time expired").await;
+            failed.push((r, "5.4.7 Delivery time expired (DELIVERBY)".into()));
+        }
+    }
     if !remaining.is_empty() && age_hours >= settings.delivery.max_queue_hours as i64 {
         for r in remaining.drain(..) {
             failed.push((r, format!("gave up after {age_hours} hours: {last_error}")));

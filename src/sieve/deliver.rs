@@ -157,11 +157,14 @@ fn jmap_vacation(v: &super::VacationSettings) -> Vacation {
 
 pub async fn execute(state: &State, account_id: i64, sender: &str, raw: &[u8], plan: Plan) -> anyhow::Result<()> {
     let mut seen = std::collections::BTreeSet::new();
+    // Filters have seen the message; what's kept is encrypted to the owner's
+    // key when they have one (forwards and replies below use the original).
+    let stored = if plan.stores.is_empty() { std::borrow::Cow::Borrowed(raw) } else { crate::encryption::for_storage(state, account_id, raw).await? };
     for (folder, flags) in &plan.stores {
         if !seen.insert(folder.to_ascii_lowercase()) {
             continue;
         }
-        crate::smtp::store_in(state, account_id, folder, raw, &flags.join(" ")).await?;
+        crate::smtp::store_in(state, account_id, folder, &stored, &flags.join(" ")).await?;
     }
     for addr in &plan.redirects {
         let env_from = if sender.is_empty() { String::new() } else { crate::smtp::delivery::srs_forward(state, sender).await };

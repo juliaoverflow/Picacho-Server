@@ -21,6 +21,21 @@ pub struct Config {
     pub log: Log,
     pub limits: Limits,
     pub dns: Dns,
+    /// Kerberos sign-in (SASL GSSAPI) for mail apps; off unless set.
+    pub kerberos: Option<Kerberos>,
+}
+
+/// `[kerberos]`: accept Kerberos tickets (SASL GSSAPI, RFC 4752).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct Kerberos {
+    pub enabled: bool,
+    /// Keytab with imap/, smtp/, pop/ and sieve/<host> keys.
+    pub keytab: PathBuf,
+    /// Only principals of this realm sign in (empty: any the keytab trusts).
+    pub realm: String,
+    /// Mailbox domain for `user@REALM` (empty: the primary domain).
+    pub domain: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +53,10 @@ pub struct Listen {
     pub imaps: Vec<SocketAddr>,
     /// ManageSieve (RFC 5804) for editing filters from mail apps (4190).
     pub managesieve: Vec<SocketAddr>,
+    /// POP3 with STLS (110). Off unless listed.
+    pub pop3: Vec<SocketAddr>,
+    /// POP3 over implicit TLS (995). Off unless listed.
+    pub pop3s: Vec<SocketAddr>,
     /// Accept PROXY protocol v1/v2 headers from these load balancers.
     pub proxy_protocol_from: Vec<String>,
 }
@@ -52,6 +71,8 @@ impl Default for Listen {
             imap: vec![a("0.0.0.0:143")],
             imaps: vec![a("0.0.0.0:993")],
             managesieve: vec![a("0.0.0.0:4190")],
+            pop3: vec![],
+            pop3s: vec![],
             proxy_protocol_from: vec![],
         }
     }

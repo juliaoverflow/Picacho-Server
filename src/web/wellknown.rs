@@ -103,6 +103,7 @@ async fn endpoints(state: &State, headers: &HeaderMap, email: &str) -> serde_jso
         "imap": {"host": host, "port": port(&l.imaps, 993), "socket": "SSL", "starttls_port": port(&l.imap, 143), "enabled": !l.imaps.is_empty() || !l.imap.is_empty()},
         "smtp": {"host": host, "port": port(&l.submissions, 465), "socket": "SSL", "starttls_port": port(&l.submission, 587), "enabled": !l.submissions.is_empty() || !l.submission.is_empty()},
         "managesieve": {"host": host, "port": port(&l.managesieve, 4190), "enabled": !l.managesieve.is_empty()},
+        "pop3": {"host": host, "port": port(&l.pop3s, 995), "socket": if l.pop3s.is_empty() { "STARTTLS" } else { "SSL" }, "starttls_port": port(&l.pop3, 110), "enabled": !l.pop3s.is_empty() || !l.pop3.is_empty()},
         "jmap": format!("{base}/.well-known/jmap"),
         "caldav": format!("{base}/dav/"),
         "carddav": format!("{base}/dav/"),
@@ -162,6 +163,13 @@ async fn autoconfig(AxState(state): AxState<State>, headers: HeaderMap, Query(q)
         "    <incomingServer type=\"imap\">\n      <hostname>{host}</hostname>\n      <port>{}</port>\n      <socketType>STARTTLS</socketType>\n      <authentication>password-cleartext</authentication>\n      <username>%EMAILADDRESS%</username>\n    </incomingServer>\n",
         e["imap"]["starttls_port"]
     ));
+    // POP3 after IMAP, so apps that pick the first entry still choose IMAP.
+    if e["pop3"]["enabled"] == true {
+        let (port, socket) = if state.config.listen.pop3s.is_empty() { (&e["pop3"]["starttls_port"], "STARTTLS") } else { (&e["pop3"]["port"], "SSL") };
+        body.push_str(&format!(
+            "    <incomingServer type=\"pop3\">\n      <hostname>{host}</hostname>\n      <port>{port}</port>\n      <socketType>{socket}</socketType>\n      <authentication>password-cleartext</authentication>\n{oauth_auth}      <username>%EMAILADDRESS%</username>\n      <pop3>\n        <leaveMessagesOnServer>true</leaveMessagesOnServer>\n      </pop3>\n    </incomingServer>\n"
+        ));
+    }
     body.push_str(&format!(
         "    <outgoingServer type=\"smtp\">\n      <hostname>{host}</hostname>\n      <port>{}</port>\n      <socketType>SSL</socketType>\n      <authentication>password-cleartext</authentication>\n{oauth_auth}      <username>%EMAILADDRESS%</username>\n    </outgoingServer>\n",
         e["smtp"]["port"]

@@ -44,6 +44,13 @@ pub enum Att {
         path: Vec<usize>,
         label: String,
     },
+    /// RFC 8474 OBJECTID.
+    EmailId,
+    ThreadId,
+    /// RFC 8514: when the message was saved in this mailbox.
+    SaveDate,
+    /// RFC 8970: a short plain-text preview.
+    Preview,
 }
 
 impl Att {
@@ -74,6 +81,13 @@ pub fn parse_atts(arg: &Arg) -> Result<Vec<Att>, String> {
             for i in items {
                 match i {
                     Arg::Atom(a) => out.push(parse_att(a)?),
+                    // RFC 8970 preview modifiers: `PREVIEW (LAZY)`. Previews are
+                    // always available here, so LAZY changes nothing.
+                    Arg::List(m) if matches!(out.last(), Some(Att::Preview)) => {
+                        if !m.iter().all(|x| x.as_atom().is_some_and(|a| a.eq_ignore_ascii_case("LAZY"))) {
+                            return Err("Unknown PREVIEW modifier".into());
+                        }
+                    }
                     _ => return Err("Invalid fetch attribute".into()),
                 }
             }
@@ -100,6 +114,10 @@ fn parse_att(a: &str) -> Result<Att, String> {
         "RFC822.HEADER" => Att::Rfc822Header,
         "RFC822.TEXT" => Att::Rfc822Text,
         "MODSEQ" => Att::ModSeq,
+        "EMAILID" => Att::EmailId,
+        "THREADID" => Att::ThreadId,
+        "SAVEDATE" => Att::SaveDate,
+        "PREVIEW" => Att::Preview,
         _ if up.starts_with("BINARY") => {
             let (kind, rest) = if let Some(r) = up.strip_prefix("BINARY.PEEK[") {
                 (1, &a[a.len() - r.len()..])

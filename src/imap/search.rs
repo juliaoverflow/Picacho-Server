@@ -32,6 +32,17 @@ pub enum Key {
     /// WITHIN: internal date older / younger than n seconds.
     Older(i64),
     Younger(i64),
+    /// SEARCHRES (RFC 5182): the result saved by an earlier `RETURN (SAVE)`.
+    Saved,
+    /// OBJECTID (RFC 8474).
+    EmailId(i64),
+    ThreadId(i64),
+    /// SAVEDATE (RFC 8514): when the message was put in the mailbox.
+    SavedBefore(NaiveDate),
+    SavedOn(NaiveDate),
+    SavedSince(NaiveDate),
+    /// SEARCH=FUZZY (RFC 6203): text keys inside match loosely.
+    Fuzzy(Box<Key>),
 }
 
 impl Key {
@@ -39,7 +50,7 @@ impl Key {
     pub fn uses_modseq(&self) -> bool {
         match self {
             Key::ModSeq(_) => true,
-            Key::Not(k) => k.uses_modseq(),
+            Key::Not(k) | Key::Fuzzy(k) => k.uses_modseq(),
             Key::Or(a, b) => a.uses_modseq() || b.uses_modseq(),
             Key::And(v) => v.iter().any(|k| k.uses_modseq()),
             _ => false,
@@ -50,7 +61,7 @@ impl Key {
     pub fn needs_content(&self) -> bool {
         match self {
             Key::Header(..) | Key::Body(_) | Key::Text(_) | Key::SentBefore(_) | Key::SentOn(_) | Key::SentSince(_) => true,
-            Key::Not(k) => k.needs_content(),
+            Key::Not(k) | Key::Fuzzy(k) => k.needs_content(),
             Key::Or(a, b) => a.needs_content() || b.needs_content(),
             Key::And(v) => v.iter().any(|k| k.needs_content()),
             _ => false,
@@ -145,7 +156,23 @@ impl<'a> KeyParser<'a> {
             "SENTSINCE" => Key::SentSince(self.date()?),
             "LARGER" => Key::Larger(self.number()?),
             "SMALLER" => Key::Smaller(self.number()?),
-            "UID" => Key::Uid(SeqSet::parse(self.next()?.as_atom().ok_or("Expected UID set")?).ok_or("Invalid UID set")?),
+            "UID" => match self.next()?.as_atom().ok_or("Expected UID set")? {
+                "$" => Key::Saved,
+                set => Key::Uid(SeqSet::parse(set).ok_or("Invalid UID set")?),
+            },
+            "$" => Key::Saved,
+            "EMAILID" | "THREADID" => {
+                let v = self.next()?.string().ok_or("Expected an object id")?;
+                let prefix = if atom == "EMAILID" { 'e' } else { 't' };
+                // Unknown ids match nothing.
+                let n = v.strip_prefix(prefix).and_then(|n| n.parse::<i64>().ok()).unwrap_or(-1);
+                if atom == "EMAILID" { Key::EmailId(n) } else { Key::ThreadId(n) }
+            }
+            "SAVEDBEFORE" => Key::SavedBefore(self.date()?),
+            "SAVEDON" => Key::SavedOn(self.date()?),
+            "SAVEDSINCE" => Key::SavedSince(self.date()?),
+            "SAVEDATESUPPORTED" => Key::All,
+            "FUZZY" => Key::Fuzzy(Box::new(self.key()?)),
             "NOT" => Key::Not(Box::new(self.key()?)),
             "MODSEQ" => {
                 // Optional entry name and type (e.g. "/flags/\\seen" all) are accepted and ignored.
@@ -184,6 +211,12 @@ pub struct Ctx<'a> {
     pub size: i64,
     pub internal_date: i64,
     pub modseq: i64,
+    /// In the saved search result (SEARCHRES).
+    pub saved: bool,
+    pub email_id: i64,
+    pub thread_id: i64,
+    /// When the message was put in this mailbox.
+    pub saved_at: i64,
     /// Loaded lazily by the caller when `needs_content`.
     pub content: Option<&'a Content>,
 }
@@ -251,8 +284,57 @@ fn day_of(ts: i64) -> NaiveDate {
     chrono::Utc.timestamp_opt(ts, 0).single().map(|d| d.date_naive()).unwrap_or_default()
 }
 
+/// Lowercase, without accents (é -> e), words split on non-alphanumerics.
+fn fold(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars().flat_map(|c| c.to_lowercase()) {
+        let base = match ch {
+            'à'..='å' | 'ā' | 'ă' | 'ą' => 'a',
+            'ç' | 'ć' | 'č' => 'c',
+            'è'..='ë' | 'ē' | 'ę' | 'ě' => 'e',
+            'ì'..='ï' | 'ī' => 'i',
+            'ñ' | 'ń' | 'ň' => 'n',
+            'ò'..='ö' | 'ø' | 'ō' | 'ő' => 'o',
+            'ù'..='ü' | 'ū' | 'ů' | 'ű' => 'u',
+            'ý' | 'ÿ' => 'y',
+            'ß' => {
+                out.push_str("ss");
+                continue;
+            }
+            c if c.is_alphanumeric() => c,
+            _ => ' ',
+        };
+        let _ = write!(out, "{base}");
+    }
+    out
+}
+
+/// Fuzzy text match: every word of the needle appears (accents and case
+/// aside), each as a prefix of some word of the text.
+fn fuzzy_in(hay: &str, needle: &[u8]) -> bool {
+    let hay = fold(hay);
+    let words: Vec<&str> = hay.split_whitespace().collect();
+    let n = fold(&String::from_utf8_lossy(needle));
+    n.split_whitespace().all(|w| words.iter().any(|h| h.starts_with(w)))
+}
+
+fn eval_fuzzy(k: &Key, c: &Ctx) -> bool {
+    let Some(content) = c.content else { return eval(k, c) };
+    match k {
+        Key::Body(v) => fuzzy_in(&content.body, v),
+        Key::Text(v) => fuzzy_in(&content.body, v) || content.headers.iter().any(|(_, h)| fuzzy_in(h, v)),
+        Key::Header(name, v) => content.headers.iter().any(|(n, h)| n == name && fuzzy_in(h, v)),
+        Key::Not(x) => !eval_fuzzy(x, c),
+        Key::Or(a, b) => eval_fuzzy(a, c) || eval_fuzzy(b, c),
+        Key::And(v) => v.iter().all(|x| eval_fuzzy(x, c)),
+        other => eval(other, c),
+    }
+}
+
 pub fn eval(k: &Key, c: &Ctx) -> bool {
     match k {
+        Key::Fuzzy(inner) => eval_fuzzy(inner, c),
         Key::All => true,
         Key::Flag(f, want) => has_flag(c.flags, f) == *want,
         Key::Keyword(kw, want) => has_flag(c.flags, kw) == *want,
@@ -270,6 +352,12 @@ pub fn eval(k: &Key, c: &Ctx) -> bool {
         Key::ModSeq(n) => c.modseq >= *n,
         Key::Older(n) => crate::util::now() - c.internal_date > *n,
         Key::Younger(n) => crate::util::now() - c.internal_date <= *n,
+        Key::Saved => c.saved,
+        Key::EmailId(n) => c.email_id == *n,
+        Key::ThreadId(n) => c.thread_id == *n,
+        Key::SavedBefore(d) => day_of(c.saved_at) < *d,
+        Key::SavedOn(d) => day_of(c.saved_at) == *d,
+        Key::SavedSince(d) => day_of(c.saved_at) >= *d,
         Key::Or(a, b) => eval(a, c) || eval(b, c),
         Key::And(v) => v.iter().all(|k| eval(k, c)),
         Key::SentBefore(d) | Key::SentOn(d) | Key::SentSince(d) => {

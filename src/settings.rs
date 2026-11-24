@@ -252,11 +252,14 @@ pub struct DavSettings {
     pub max_resource_bytes: u64,
     /// Create a default calendar and address book for new principals.
     pub create_defaults: bool,
+    /// Let calendar apps look up when other people on this server are busy
+    /// (RFC 6638 free/busy; times only, never what the events are).
+    pub free_busy_lookup: bool,
 }
 
 impl Default for DavSettings {
     fn default() -> Self {
-        Self { enabled: true, mail_accounts: true, default_quota_mb: 10 * 1024, max_resource_bytes: 1024 * 1024 * 1024, create_defaults: true }
+        Self { enabled: true, mail_accounts: true, default_quota_mb: 10 * 1024, max_resource_bytes: 1024 * 1024 * 1024, create_defaults: true, free_busy_lookup: true }
     }
 }
 
@@ -271,11 +274,163 @@ pub struct AuthSettings {
     /// need an app password or an OAuth token.
     pub mail_password_login: bool,
     pub oidc: OidcSettings,
+    pub ldap: LdapSettings,
 }
 
 impl Default for AuthSettings {
     fn default() -> Self {
-        Self { web_password_login: true, mail_password_login: true, oidc: OidcSettings::default() }
+        Self { web_password_login: true, mail_password_login: true, oidc: OidcSettings::default(), ldap: LdapSettings::default() }
+    }
+}
+
+impl AuthSettings {
+    /// Directory passwords for the web console.
+    pub fn ldap_web(&self) -> bool {
+        self.ldap.enabled && self.ldap.web_login
+    }
+
+    /// Directory passwords for IMAP, SMTP, JMAP, DAV and ManageSieve.
+    pub fn ldap_mail(&self) -> bool {
+        self.ldap.enabled && self.ldap.mail_login
+    }
+}
+
+/// Passwords checked against an LDAP directory (OpenLDAP, Active Directory,
+/// FreeIPA, LLDAP, …). Works next to local passwords, single sign-on and
+/// access tokens: a mailbox that signs in to the console with SSO can use
+/// its directory password in mail apps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LdapSettings {
+    pub enabled: bool,
+    /// Shown on the sign-in page: "Use your {display_name} account".
+    pub display_name: String,
+    /// ldaps://host:636, ldap://host:389 or ldapi://%2Frun%2Fslapd%2Fldapi
+    pub url: String,
+    /// Upgrade ldap:// with StartTLS.
+    pub starttls: bool,
+    /// Allow ldap:// without StartTLS to a non-local host (passwords travel in clear).
+    pub allow_plaintext: bool,
+    /// Don't verify the directory's certificate (testing only).
+    pub tls_skip_verify: bool,
+    /// Extra trusted CA certificates (PEM) for a private directory CA.
+    pub ca_cert: String,
+    /// Service account used to find users. Empty: anonymous search.
+    pub bind_dn: String,
+    pub bind_password: Option<String>,
+    /// Bind directly as the user instead of searching first, e.g.
+    /// "uid={user},ou=people,dc=example,dc=com" or "{user}@corp.example.com".
+    pub user_dn_template: String,
+    /// Where users live.
+    pub base_dn: String,
+    /// Finds the user. Placeholders: {user} (as typed), {local} and {domain}
+    /// (parts of an email address); values are escaped.
+    pub user_filter: String,
+    /// Attribute with the user's mailbox address(es).
+    pub email_attr: String,
+    /// Attribute with the display name (falls back to cn).
+    pub name_attr: String,
+    /// Attribute on the user listing group DNs (memberOf). Empty: none.
+    pub group_attr: String,
+    /// Also search for groups here (empty: only `group_attr`).
+    pub group_base_dn: String,
+    /// Placeholders: {dn} (the user's DN), {user}, {local}.
+    pub group_filter: String,
+    pub group_name_attr: String,
+    /// Members of these groups (name or DN) are administrators, others
+    /// users. Empty: roles are managed here.
+    pub admin_groups: Vec<String>,
+    /// Only members of these groups may sign in (empty: anyone found).
+    pub required_groups: Vec<String>,
+    /// Create the mailbox on first sign-in when its address is on a local domain.
+    pub auto_create_accounts: bool,
+    /// Accept directory passwords in the web console.
+    pub web_login: bool,
+    /// Accept directory passwords in mail, calendar and contacts apps.
+    pub mail_login: bool,
+}
+
+impl Default for LdapSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            display_name: "Directory".into(),
+            url: String::new(),
+            starttls: false,
+            allow_plaintext: false,
+            tls_skip_verify: false,
+            ca_cert: String::new(),
+            bind_dn: String::new(),
+            bind_password: None,
+            user_dn_template: String::new(),
+            base_dn: String::new(),
+            user_filter: "(&(objectClass=person)(|(uid={user})(mail={user})))".into(),
+            email_attr: "mail".into(),
+            name_attr: "displayName".into(),
+            group_attr: "memberOf".into(),
+            group_base_dn: String::new(),
+            group_filter: "(|(member={dn})(uniqueMember={dn}))".into(),
+            group_name_attr: "cn".into(),
+            admin_groups: vec![],
+            required_groups: vec![],
+            auto_create_accounts: false,
+            web_login: true,
+            mail_login: true,
+        }
+    }
+}
+
+impl LdapSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        let u = url::Url::parse(self.url.trim()).map_err(|_| "Enter the directory URL, like ldaps://ldap.example.com.".to_string())?;
+        match u.scheme() {
+            "ldaps" | "ldapi" => {}
+            "ldap" => {
+                let local = matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]" | "::1"));
+                if !self.starttls && !self.allow_plaintext && !local {
+                    return Err("Use ldaps:// or StartTLS, or explicitly allow unencrypted LDAP; passwords would travel in clear.".into());
+                }
+            }
+            _ => return Err("The directory URL must start with ldap://, ldaps:// or ldapi://.".into()),
+        }
+        if self.starttls && u.scheme() != "ldap" {
+            return Err("StartTLS is only for ldap:// URLs.".into());
+        }
+        let direct = !self.user_dn_template.trim().is_empty();
+        if direct && !self.user_dn_template.contains("{user}") && !self.user_dn_template.contains("{local}") {
+            return Err("The user DN template needs {user} or {local}.".into());
+        }
+        if self.base_dn.trim().is_empty() {
+            return Err("Enter the base DN where users live.".into());
+        }
+        if !direct && !self.bind_dn.trim().is_empty() && self.bind_password.as_deref().unwrap_or("").is_empty() {
+            return Err("Enter the service account's password.".into());
+        }
+        if !["{user}", "{local}", "{domain}"].iter().any(|p| self.user_filter.contains(p)) {
+            return Err("The user filter needs {user} (or {local}).".into());
+        }
+        let probe = |f: &str| f.replace("{user}", "x").replace("{local}", "x").replace("{domain}", "x").replace("{dn}", "x");
+        if ldap3::parse_filter(probe(self.user_filter.trim())).is_err() {
+            return Err("The user filter isn't a valid LDAP filter.".into());
+        }
+        if !self.group_base_dn.trim().is_empty() && ldap3::parse_filter(probe(self.group_filter.trim())).is_err() {
+            return Err("The group filter isn't a valid LDAP filter.".into());
+        }
+        if self.email_attr.trim().is_empty() {
+            return Err("Enter the attribute holding email addresses (usually mail).".into());
+        }
+        if !self.ca_cert.trim().is_empty() && rustls_pemfile::certs(&mut self.ca_cert.as_bytes()).filter_map(Result::ok).next().is_none() {
+            return Err("The CA certificate must be PEM (-----BEGIN CERTIFICATE-----).".into());
+        }
+        if !self.web_login && !self.mail_login {
+            return Err("Use the directory for the console, for apps, or both.".into());
+        }
+        Ok(())
+    }
+
+    /// Changes whenever any setting does, so cached logins don't outlive a reconfiguration.
+    pub fn fingerprint(&self) -> String {
+        format!("ldap:{}", crate::util::sha256_hex(serde_json::to_string(self).unwrap_or_default().as_bytes()))
     }
 }
 
@@ -460,6 +615,9 @@ pub struct LimitSettings {
     /// Messages a user may submit per hour (0 = unlimited).
     pub send_rate_per_hour: u32,
     pub max_imap_sessions_per_user: usize,
+    /// How far ahead a submission may be held for sending later (SMTP
+    /// FUTURERELEASE, JMAP HOLDUNTIL), in days (0 = never held).
+    pub max_hold_days: u32,
 }
 
 impl Default for LimitSettings {
@@ -470,6 +628,7 @@ impl Default for LimitSettings {
             default_quota_mb: 5 * 1024,
             send_rate_per_hour: 500,
             max_imap_sessions_per_user: 50,
+            max_hold_days: 31,
         }
     }
 }
@@ -599,6 +758,9 @@ impl LiveSettings {
         if s.auth.oidc.client_secret.as_deref().is_some_and(|p| !p.is_empty()) {
             s.auth.oidc.client_secret = Some(REDACTED.into());
         }
+        if s.auth.ldap.bind_password.as_deref().is_some_and(|p| !p.is_empty()) {
+            s.auth.ldap.bind_password = Some(REDACTED.into());
+        }
         if let Some(r) = &mut s.filter.rspamd {
             if r.password.as_deref().is_some_and(|p| !p.is_empty()) {
                 r.password = Some(REDACTED.into());
@@ -625,6 +787,9 @@ impl LiveSettings {
     pub fn merge_secrets_from(&mut self, old: &LiveSettings) {
         if self.auth.oidc.client_secret.as_deref() == Some(REDACTED) {
             self.auth.oidc.client_secret = old.auth.oidc.client_secret.clone();
+        }
+        if self.auth.ldap.bind_password.as_deref() == Some(REDACTED) {
+            self.auth.ldap.bind_password = old.auth.ldap.bind_password.clone();
         }
         if let Some(r) = &mut self.filter.rspamd {
             if r.password.as_deref() == Some(REDACTED) {
@@ -690,8 +855,11 @@ impl LiveSettings {
                 return Err("The OIDC client ID is required.".into());
             }
         }
-        if !self.auth.web_password_login && !o.enabled {
-            return Err("Turn on single sign-on before turning off password sign-in.".into());
+        if self.auth.ldap.enabled {
+            self.auth.ldap.validate()?;
+        }
+        if !self.auth.web_password_login && !o.enabled && !self.auth.ldap_web() {
+            return Err("Turn on single sign-on or directory sign-in before turning off password sign-in.".into());
         }
         if o.access_tokens {
             if !(o.issuer.starts_with("https://") || is_local_http(&o.issuer)) {

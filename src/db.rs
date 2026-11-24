@@ -115,6 +115,9 @@ pub struct MessageRow {
     pub msgid: String,
     pub thread_id: i64,
     pub mailbox_id: i64,
+    /// When the message was put in its mailbox (IMAP SAVEDATE); 0 for rows
+    /// saved before this was recorded.
+    pub saved_at: i64,
 }
 
 /// The per-message state an IMAP session keeps in its view.
@@ -147,6 +150,45 @@ pub struct QueueItem {
     pub delay_notified: bool,
     /// Relay peer that will pick this message up (status 'held').
     pub peer: String,
+    /// The JMAP submission this delivers, for its deliveryStatus (0: none).
+    #[serde(skip)]
+    pub submission_id: i64,
+}
+
+/// A message an account sent or holds for later (JMAP EmailSubmission).
+#[derive(Debug, Clone)]
+pub struct Submission {
+    pub id: i64,
+    pub account_id: i64,
+    pub identity: String,
+    pub email_id: i64,
+    pub thread_id: i64,
+    pub sender: String,
+    pub recipients: Vec<String>,
+    /// The message to send while pending; released once sent or canceled.
+    pub blob: String,
+    pub size: i64,
+    pub send_at: i64,
+    /// pending, final or canceled.
+    pub undo_status: String,
+    /// JSON: recipient -> {smtpReply, delivered, displayed}.
+    pub delivery: String,
+    pub dsn: String,
+    pub requiretls: bool,
+    pub created_at: i64,
+}
+
+/// A JMAP identity's stored settings.
+#[derive(Debug, Clone, Default)]
+pub struct IdentityRow {
+    pub id: i64,
+    pub builtin: String,
+    pub email: String,
+    pub name: String,
+    pub reply_to: String,
+    pub bcc: String,
+    pub text_signature: String,
+    pub html_signature: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +324,7 @@ fn message_from(r: &AnyRow) -> Result<MessageRow> {
         msgid: r.try_get("msgid")?,
         thread_id: r.try_get("thread_id")?,
         mailbox_id: r.try_get("mailbox_id")?,
+        saved_at: r.try_get("saved_at")?,
     })
 }
 
@@ -303,14 +346,50 @@ fn queue_from(r: &AnyRow) -> Result<QueueItem> {
         requiretls: b(r.try_get("requiretls")?),
         delay_notified: b(r.try_get("delay_notified")?),
         peer: r.try_get("peer")?,
+        submission_id: r.try_get("submission_id")?,
     })
 }
 
 const ACCOUNT_COLS: &str = "id, email, domain_id, password_hash, display_name, role, quota_bytes, used_bytes, active, can_send_external, forward_to, keep_copy, created_at, last_login, oidc_sub";
 const DOMAIN_COLS: &str = "id, name, mode, transport, catch_all, dkim_selector, dkim_private, dkim_public, active, created_at";
 const MAILBOX_COLS: &str = "id, account_id, name, uidvalidity, uidnext, modseq, recent_uid, special_use, keywords";
-const MESSAGE_COLS: &str = "id, uid, blob, size, internal_date, flags, envelope, bodystructure, body, modseq, meta, msgid, thread_id, mailbox_id";
-const QUEUE_COLS: &str = "id, sender, recipients, blob, size, attempts, next_attempt, last_error, status, route, created_at, dsn, requiretls, delay_notified, peer";
+const MESSAGE_COLS: &str = "id, uid, blob, size, internal_date, flags, envelope, bodystructure, body, modseq, meta, msgid, thread_id, mailbox_id, saved_at";
+const QUEUE_COLS: &str = "id, sender, recipients, blob, size, attempts, next_attempt, last_error, status, route, created_at, dsn, requiretls, delay_notified, peer, submission_id";
+const SUBMISSION_COLS: &str = "id, account_id, identity, email_id, thread_id, sender, recipients, blob, size, send_at, undo_status, delivery, dsn, requiretls, created_at";
+
+fn submission_from(r: &AnyRow) -> Result<Submission> {
+    let rcpts: String = r.try_get("recipients")?;
+    Ok(Submission {
+        id: r.try_get("id")?,
+        account_id: r.try_get("account_id")?,
+        identity: r.try_get("identity")?,
+        email_id: r.try_get("email_id")?,
+        thread_id: r.try_get("thread_id")?,
+        sender: r.try_get("sender")?,
+        recipients: serde_json::from_str(&rcpts).unwrap_or_default(),
+        blob: r.try_get("blob")?,
+        size: r.try_get("size")?,
+        send_at: r.try_get("send_at")?,
+        undo_status: r.try_get("undo_status")?,
+        delivery: r.try_get("delivery")?,
+        dsn: r.try_get("dsn")?,
+        requiretls: b(r.try_get("requiretls")?),
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+fn identity_from(r: &AnyRow) -> Result<IdentityRow> {
+    Ok(IdentityRow {
+        id: r.try_get("id")?,
+        builtin: r.try_get("builtin")?,
+        email: r.try_get("email")?,
+        name: r.try_get("name")?,
+        reply_to: r.try_get("reply_to")?,
+        bcc: r.try_get("bcc")?,
+        text_signature: r.try_get("text_signature")?,
+        html_signature: r.try_get("html_signature")?,
+    })
+}
 
 fn schema(kind: &DatabaseKind) -> Vec<String> {
     let (id, int, blob) = match kind {
@@ -361,6 +440,27 @@ fn schema(kind: &DatabaseKind) -> Vec<String> {
             last_error TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued',
             route TEXT NOT NULL DEFAULT '', created_at {int} NOT NULL)"),
         s("CREATE INDEX IF NOT EXISTS queue_due ON queue (status, next_attempt)"),
+        // Mail sent by an account (JMAP EmailSubmission), including mail held
+        // for later (FUTURERELEASE/HOLDUNTIL; undo_status 'pending').
+        s("CREATE TABLE IF NOT EXISTS submissions (
+            id {id}, account_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            identity TEXT NOT NULL DEFAULT '', email_id {int} NOT NULL DEFAULT 0, thread_id {int} NOT NULL DEFAULT 0,
+            sender TEXT NOT NULL, recipients TEXT NOT NULL, blob TEXT NOT NULL DEFAULT '', size {int} NOT NULL DEFAULT 0,
+            send_at {int} NOT NULL, undo_status TEXT NOT NULL, delivery TEXT NOT NULL DEFAULT '{}',
+            dsn TEXT NOT NULL DEFAULT '', requiretls {int} NOT NULL DEFAULT 0, created_at {int} NOT NULL)"),
+        s("CREATE INDEX IF NOT EXISTS submissions_due ON submissions (undo_status, send_at)"),
+        s("CREATE INDEX IF NOT EXISTS submissions_account ON submissions (account_id, send_at)"),
+        // JMAP identities: settings for built-in ones (builtin = their id) and
+        // extra ones an account created.
+        s("CREATE TABLE IF NOT EXISTS identities (
+            id {id}, account_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            builtin TEXT NOT NULL DEFAULT '', email TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+            reply_to TEXT NOT NULL DEFAULT '', bcc TEXT NOT NULL DEFAULT '',
+            text_signature TEXT NOT NULL DEFAULT '', html_signature TEXT NOT NULL DEFAULT '')"),
+        // Encryption at rest: the owner's OpenPGP public key.
+        s("CREATE TABLE IF NOT EXISTS account_keys (
+            account_id {int} PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            public_key TEXT NOT NULL, fingerprint TEXT NOT NULL, updated_at {int} NOT NULL)"),
         s("CREATE TABLE IF NOT EXISTS web_sessions (
             token_hash TEXT PRIMARY KEY, account_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
             created_at {int} NOT NULL, expires_at {int} NOT NULL, ip TEXT NOT NULL DEFAULT '')"),
@@ -442,9 +542,11 @@ impl Db {
             "meta TEXT NOT NULL DEFAULT ''".to_string(),
             "msgid TEXT NOT NULL DEFAULT ''".to_string(),
             format!("thread_id {int} NOT NULL DEFAULT 0"),
+            format!("saved_at {int} NOT NULL DEFAULT 0"),
         ] {
             let _ = sqlx::query(&format!("ALTER TABLE messages ADD COLUMN {col}")).execute(&self.pool).await;
         }
+        let _ = sqlx::query(&format!("ALTER TABLE queue ADD COLUMN submission_id {int} NOT NULL DEFAULT 0")).execute(&self.pool).await;
         for idx in [
             "CREATE INDEX IF NOT EXISTS messages_msgid ON messages (msgid)",
             "CREATE INDEX IF NOT EXISTS messages_thread ON messages (thread_id)",
@@ -1018,8 +1120,8 @@ impl Db {
             }
         }
         let r = sqlx::query(
-            "INSERT INTO messages (mailbox_id, uid, blob, size, internal_date, flags, modseq, envelope, bodystructure, body, subject, from_addr, meta, msgid, thread_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id",
+            "INSERT INTO messages (mailbox_id, uid, blob, size, internal_date, flags, modseq, envelope, bodystructure, body, subject, from_addr, meta, msgid, thread_id, saved_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
         )
         .bind(mailbox_id)
         .bind(uid)
@@ -1036,6 +1138,7 @@ impl Db {
         .bind(m.meta)
         .bind(m.msgid)
         .bind(thread)
+        .bind(now())
         .fetch_one(&mut *tx.tx)
         .await?;
         let id: i64 = r.get(0);
@@ -1679,10 +1782,11 @@ impl Db {
         .fetch_one(&mut *tx.tx)
         .await?;
         let (uid, modseq, acc): (i64, i64, i64) = (d.get(0), d.get(1), d.get(2));
-        sqlx::query("UPDATE messages SET mailbox_id = $1, uid = $2, modseq = $3 WHERE id = $4")
+        sqlx::query("UPDATE messages SET mailbox_id = $1, uid = $2, modseq = $3, saved_at = $4 WHERE id = $5")
             .bind(dst)
             .bind(uid)
             .bind(modseq)
+            .bind(now())
             .bind(id)
             .execute(&mut *tx.tx)
             .await?;
@@ -1707,6 +1811,289 @@ impl Db {
         Ok(Some(uid))
     }
 
+    /// Move messages to another mailbox of the same account keeping their
+    /// ids (IMAP MOVE; RFC 8474 keeps EMAILID). Returns (old uid, new uid).
+    pub async fn move_messages(&self, src: i64, uids: &[i64], dst: i64) -> Result<Vec<(i64, i64)>> {
+        if uids.is_empty() || src == dst {
+            return Ok(vec![]);
+        }
+        let mut tx = self.begin().await?;
+        let mut pairs = vec![];
+        let mut ids = vec![];
+        let acc: i64 = sqlx::query("SELECT account_id FROM mailboxes WHERE id = $1").bind(dst).fetch_one(&mut *tx.tx).await?.get(0);
+        for &old in uids {
+            let Some(r) = sqlx::query("SELECT id, flags FROM messages WHERE mailbox_id = $1 AND uid = $2")
+                .bind(src)
+                .bind(old)
+                .fetch_optional(&mut *tx.tx)
+                .await?
+            else {
+                continue;
+            };
+            let id: i64 = r.get(0);
+            let flags: String = r.get(1);
+            let d = sqlx::query("UPDATE mailboxes SET uidnext = uidnext + 1, modseq = modseq + 1 WHERE id = $1 RETURNING uidnext - 1, modseq")
+                .bind(dst)
+                .fetch_one(&mut *tx.tx)
+                .await?;
+            let (uid, modseq): (i64, i64) = (d.get(0), d.get(1));
+            sqlx::query("UPDATE messages SET mailbox_id = $1, uid = $2, modseq = $3, saved_at = $4, flags = $5 WHERE id = $6")
+                .bind(dst)
+                .bind(uid)
+                .bind(modseq)
+                .bind(now())
+                .bind(crate::imap::flags_without_recent(&flags))
+                .bind(id)
+                .execute(&mut *tx.tx)
+                .await?;
+            pairs.push((old, uid));
+            ids.push(id);
+        }
+        if !pairs.is_empty() {
+            let sm: i64 = sqlx::query("UPDATE mailboxes SET modseq = modseq + 1 WHERE id = $1 RETURNING modseq")
+                .bind(src)
+                .fetch_one(&mut *tx.tx)
+                .await?
+                .get(0);
+            for (old, _) in &pairs {
+                sqlx::query(
+                    "INSERT INTO expunged (mailbox_id, uid, modseq) VALUES ($1, $2, $3)
+                     ON CONFLICT (mailbox_id, uid) DO UPDATE SET modseq = excluded.modseq",
+                )
+                .bind(src)
+                .bind(old)
+                .bind(sm)
+                .execute(&mut *tx.tx)
+                .await?;
+            }
+            for id in ids {
+                Self::log_change(&mut tx, acc, "Email", id, "u").await?;
+            }
+            Self::log_change(&mut tx, acc, "Mailbox", src, "u").await?;
+            Self::log_change(&mut tx, acc, "Mailbox", dst, "u").await?;
+        }
+        tx.commit().await?;
+        Ok(pairs)
+    }
+
+    // ---------- submissions ----------
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_submission(&self, s: &Submission) -> Result<i64> {
+        let mut tx = self.begin().await?;
+        let r = sqlx::query(
+            "INSERT INTO submissions (account_id, identity, email_id, thread_id, sender, recipients, blob, size, send_at, undo_status, delivery, dsn, requiretls, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+        )
+        .bind(s.account_id)
+        .bind(&s.identity)
+        .bind(s.email_id)
+        .bind(s.thread_id)
+        .bind(&s.sender)
+        .bind(serde_json::to_string(&s.recipients)?)
+        .bind(&s.blob)
+        .bind(s.size)
+        .bind(s.send_at)
+        .bind(&s.undo_status)
+        .bind(&s.delivery)
+        .bind(&s.dsn)
+        .bind(s.requiretls as i64)
+        .bind(now())
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        let id: i64 = r.get(0);
+        if !s.blob.is_empty() {
+            Self::ref_blob_tx(&mut tx, &s.blob, s.size).await?;
+        }
+        Self::log_change(&mut tx, s.account_id, "EmailSubmission", id, "c").await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn submission(&self, id: i64) -> Result<Option<Submission>> {
+        let r = sqlx::query(&format!("SELECT {SUBMISSION_COLS} FROM submissions WHERE id = $1")).bind(id).fetch_optional(&self.pool).await?;
+        r.as_ref().map(submission_from).transpose()
+    }
+
+    pub async fn submissions(&self, account_id: i64) -> Result<Vec<Submission>> {
+        let rows = sqlx::query(&format!("SELECT {SUBMISSION_COLS} FROM submissions WHERE account_id = $1 ORDER BY send_at, id"))
+            .bind(account_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(submission_from).collect()
+    }
+
+    /// Pending submissions due by `at`.
+    pub async fn due_submissions(&self, at: i64) -> Result<Vec<Submission>> {
+        let rows = sqlx::query(&format!("SELECT {SUBMISSION_COLS} FROM submissions WHERE undo_status = 'pending' AND send_at <= $1 ORDER BY send_at LIMIT 200"))
+            .bind(at)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(submission_from).collect()
+    }
+
+    /// Move a pending submission to `final` or `canceled`, releasing its
+    /// message. `None` when it wasn't pending (already sent or canceled):
+    /// this is how a release and a cancel racing each other are settled.
+    /// Otherwise the blob keys no longer referenced, to delete.
+    pub async fn finish_submission(&self, id: i64, status: &str, delivery: Option<&str>) -> Result<Option<Vec<String>>> {
+        let mut tx = self.begin().await?;
+        let Some(r) = sqlx::query("SELECT account_id, blob FROM submissions WHERE id = $1 AND undo_status = 'pending'")
+            .bind(id)
+            .fetch_optional(&mut *tx.tx)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let account_id: i64 = r.get(0);
+        let blob: String = r.get(1);
+        match delivery {
+            Some(d) => sqlx::query("UPDATE submissions SET undo_status = $1, delivery = $2, blob = '' WHERE id = $3").bind(status).bind(d).bind(id),
+            None => sqlx::query("UPDATE submissions SET undo_status = $1, blob = '' WHERE id = $2").bind(status).bind(id),
+        }
+        .execute(&mut *tx.tx)
+        .await?;
+        let dropped = if blob.is_empty() { vec![] } else { Self::release_blobs(&mut tx, std::slice::from_ref(&blob)).await? };
+        Self::log_change(&mut tx, account_id, "EmailSubmission", id, "u").await?;
+        tx.commit().await?;
+        Ok(Some(dropped))
+    }
+
+    /// Record a recipient's delivery outcome on a submission.
+    pub async fn set_submission_delivery(&self, id: i64, rcpt: &str, delivered: &str, reply: &str) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let Some(r) = sqlx::query("SELECT account_id, delivery FROM submissions WHERE id = $1").bind(id).fetch_optional(&mut *tx.tx).await? else {
+            return Ok(());
+        };
+        let account_id: i64 = r.get(0);
+        let mut d: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&r.get::<String, _>(1)).unwrap_or_default();
+        d.insert(rcpt.to_string(), serde_json::json!({"smtpReply": reply, "delivered": delivered, "displayed": "unknown"}));
+        sqlx::query("UPDATE submissions SET delivery = $1 WHERE id = $2").bind(serde_json::Value::Object(d).to_string()).bind(id).execute(&mut *tx.tx).await?;
+        Self::log_change(&mut tx, account_id, "EmailSubmission", id, "u").await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Forget a submission (JMAP destroy). Pending ones release their
+    /// message. `None` if there was none; else blob keys to delete.
+    pub async fn delete_submission(&self, account_id: i64, id: i64) -> Result<Option<Vec<String>>> {
+        let mut tx = self.begin().await?;
+        let Some(r) = sqlx::query("DELETE FROM submissions WHERE id = $1 AND account_id = $2 RETURNING blob")
+            .bind(id)
+            .bind(account_id)
+            .fetch_optional(&mut *tx.tx)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let blob: String = r.get(0);
+        let dropped = if blob.is_empty() { vec![] } else { Self::release_blobs(&mut tx, std::slice::from_ref(&blob)).await? };
+        Self::log_change(&mut tx, account_id, "EmailSubmission", id, "d").await?;
+        tx.commit().await?;
+        Ok(Some(dropped))
+    }
+
+    pub async fn set_queue_submission(&self, queue_id: i64, submission_id: i64) -> Result<()> {
+        let _g = self.wl().await;
+        sqlx::query("UPDATE queue SET submission_id = $1 WHERE id = $2").bind(submission_id).bind(queue_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ---------- encryption at rest ----------
+    pub async fn encryption_key(&self, account_id: i64) -> Result<Option<String>> {
+        let r = sqlx::query("SELECT public_key FROM account_keys WHERE account_id = $1").bind(account_id).fetch_optional(&self.pool).await?;
+        Ok(r.map(|r| r.get(0)))
+    }
+
+    /// (fingerprint, updated_at) of the account's key.
+    pub async fn encryption_key_info(&self, account_id: i64) -> Result<Option<(String, i64)>> {
+        let r = sqlx::query("SELECT fingerprint, updated_at FROM account_keys WHERE account_id = $1").bind(account_id).fetch_optional(&self.pool).await?;
+        Ok(r.map(|r| (r.get(0), r.get(1))))
+    }
+
+    /// Set (Some) or remove (None) the account's key.
+    pub async fn set_encryption_key(&self, account_id: i64, key: Option<(&str, &str)>) -> Result<()> {
+        let _g = self.wl().await;
+        match key {
+            Some((armored, fp)) => {
+                sqlx::query(
+                    "INSERT INTO account_keys (account_id, public_key, fingerprint, updated_at) VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (account_id) DO UPDATE SET public_key = excluded.public_key, fingerprint = excluded.fingerprint, updated_at = excluded.updated_at",
+                )
+                .bind(account_id)
+                .bind(armored)
+                .bind(fp)
+                .bind(now())
+                .execute(&self.pool)
+                .await?
+            }
+            None => sqlx::query("DELETE FROM account_keys WHERE account_id = $1").bind(account_id).execute(&self.pool).await?,
+        };
+        Ok(())
+    }
+
+    // ---------- identities ----------
+    pub async fn identities(&self, account_id: i64) -> Result<Vec<IdentityRow>> {
+        let rows = sqlx::query("SELECT id, builtin, email, name, reply_to, bcc, text_signature, html_signature FROM identities WHERE account_id = $1 ORDER BY id")
+            .bind(account_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(identity_from).collect()
+    }
+
+    /// Insert (id 0) or update an identity; returns its row id.
+    pub async fn save_identity(&self, account_id: i64, i: &IdentityRow) -> Result<i64> {
+        let mut tx = self.begin().await?;
+        let id = if i.id == 0 {
+            sqlx::query(
+                "INSERT INTO identities (account_id, builtin, email, name, reply_to, bcc, text_signature, html_signature)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+            )
+            .bind(account_id)
+            .bind(&i.builtin)
+            .bind(&i.email)
+            .bind(&i.name)
+            .bind(&i.reply_to)
+            .bind(&i.bcc)
+            .bind(&i.text_signature)
+            .bind(&i.html_signature)
+            .fetch_one(&mut *tx.tx)
+            .await?
+            .get(0)
+        } else {
+            sqlx::query(
+                "UPDATE identities SET name = $1, reply_to = $2, bcc = $3, text_signature = $4, html_signature = $5 WHERE id = $6 AND account_id = $7",
+            )
+            .bind(&i.name)
+            .bind(&i.reply_to)
+            .bind(&i.bcc)
+            .bind(&i.text_signature)
+            .bind(&i.html_signature)
+            .bind(i.id)
+            .bind(account_id)
+            .execute(&mut *tx.tx)
+            .await?;
+            i.id
+        };
+        Self::log_change(&mut tx, account_id, "Identity", id, if i.id == 0 { "c" } else { "u" }).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn delete_identity(&self, account_id: i64, id: i64) -> Result<bool> {
+        let mut tx = self.begin().await?;
+        let n = sqlx::query("DELETE FROM identities WHERE id = $1 AND account_id = $2 AND builtin = ''")
+            .bind(id)
+            .bind(account_id)
+            .execute(&mut *tx.tx)
+            .await?
+            .rows_affected();
+        if n > 0 {
+            Self::log_change(&mut tx, account_id, "Identity", id, "d").await?;
+        }
+        tx.commit().await?;
+        Ok(n > 0)
+    }
+
     pub async fn thread_counts(&self, mailbox_id: i64) -> Result<(i64, i64)> {
         let r = sqlx::query(
             "SELECT COUNT(DISTINCT thread_id),
@@ -1720,6 +2107,12 @@ impl Db {
     }
 
     // ---------- JMAP change log ----------
+    /// Record a change for JMAP (`/changes`) outside a transaction.
+    pub async fn log_jmap_change(&self, account_id: i64, kind: &str, obj: i64, op: &str) -> Result<()> {
+        let _g = self.wl().await;
+        Self::log_change_pool(&self.pool, account_id, kind, obj, op).await
+    }
+
     pub async fn jmap_state(&self, account_id: i64) -> Result<i64> {
         let r = sqlx::query("SELECT CAST(COALESCE(MAX(id), 0) AS BIGINT) FROM changes WHERE account_id = $1")
             .bind(account_id)

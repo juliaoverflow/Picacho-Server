@@ -20,7 +20,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2.2"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "query", "form", "tokio", "matched-path"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "query", "form", "tokio", "matched-path", "ws"] }
 tower-http = { version = "0.6", features = ["set-header", "compression-gzip", "limit"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
@@ -70,6 +70,10 @@ rust-embed = { version = "8", features = ["include-exclude"] }
 mime_guess = "2"
 uuid = { version = "1", features = ["v4"] }
 ring = "0.17"
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
+pgp = { version = "0.21", default-features = false }
+rand08 = { package = "rand", version = "0.8" }
+libloading = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

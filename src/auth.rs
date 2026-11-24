@@ -63,6 +63,9 @@ pub enum AuthError {
     Internal,
     /// Account passwords are turned off for this service.
     PasswordDisabled,
+    /// The directory confirmed the password, but policy refuses the sign-in
+    /// (not in a required group, or no local domain to create the mailbox on).
+    NotPermitted,
 }
 
 /// What a credential may do on a service.
@@ -175,10 +178,12 @@ pub async fn login_service(state: &State, email: &str, password: &str, ip: IpAdd
         }
         return Err(AuthError::Invalid);
     }
-    if !state.settings().auth.mail_password_login {
+    let s = state.settings();
+    let (local, ldap) = (s.auth.mail_password_login, s.auth.ldap_mail());
+    if !local && !ldap {
         return Err(AuthError::PasswordDisabled);
     }
-    login(state, email, password, ip).await.map(|a| (a, Access::Write))
+    password_login(state, email, password, ip, local, ldap).await.map(|a| (a, Access::Write))
 }
 
 /// Parse a SASL XOAUTH2 or OAUTHBEARER (RFC 7628) client response into (user, token).
@@ -303,8 +308,12 @@ impl CredCache {
     }
 
     fn hit(&self, email: &str, password: &str, hash: &str, id: i64) -> bool {
+        self.lookup(email, password, hash) == Some(id)
+    }
+
+    fn lookup(&self, email: &str, password: &str, hash: &str) -> Option<i64> {
         let t = self.tag(email, password, hash);
-        matches!(self.entries.get(&t), Some(e) if e.0 == id && e.1.elapsed() < Self::TTL)
+        self.entries.get(&t).filter(|e| e.1.elapsed() < Self::TTL).map(|e| e.0)
     }
 
     fn put(&self, email: &str, password: &str, hash: &str, id: i64) {
@@ -338,14 +347,71 @@ pub async fn token_auth(state: &State, token: &str) -> Option<(Account, crate::d
 /// A dummy hash so unknown users take as long as known ones.
 static DUMMY_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Sign in with a local password only.
 pub async fn login(state: &State, email: &str, password: &str, ip: IpAddr) -> Result<Account, AuthError> {
+    password_login(state, email, password, ip, true, false).await
+}
+
+fn record_failure(state: &State, ip: IpAddr, allowlisted: bool, sec: &crate::settings::SecuritySettings) -> AuthError {
+    crate::metrics::AUTH_FAILURES.inc();
+    if !allowlisted && state.limiter.fail(ip, sec.max_auth_failures, sec.auth_failure_window_secs, sec.ban_secs) {
+        state.event("warn", "security", &format!("banned {ip} for {}s after repeated failed logins", sec.ban_secs));
+    }
+    AuthError::Invalid
+}
+
+/// Sign in with a user name (or address) and password, checking the
+/// directory (`ldap`) and/or local password hashes (`local`).
+///
+/// The directory goes first. When it finds the user, its answer is final;
+/// when it doesn't know the user (or can't be reached), the local password
+/// is tried, so local-only accounts such as a break-glass admin keep working.
+pub async fn password_login(state: &State, user: &str, password: &str, ip: IpAddr, local: bool, ldap: bool) -> Result<Account, AuthError> {
     let sec = state.settings().security.clone();
     let allowlisted = crate::util::ip_in_list(ip, &sec.allowlist);
     if !allowlisted && state.limiter.is_banned(ip) {
         return Err(AuthError::Banned);
     }
-    let email = email.trim().to_ascii_lowercase();
+    let user = user.trim().to_ascii_lowercase();
     let password = Zeroizing::new(password.to_string());
+    if ldap {
+        let cfg = state.settings().auth.ldap.clone();
+        let fp = cfg.fingerprint();
+        if let Some(id) = state.creds.lookup(&user, &password, &fp) {
+            match state.db.get_account(id).await {
+                Ok(Some(a)) if a.active => {
+                    state.limiter.success(ip);
+                    return Ok(a);
+                }
+                Ok(Some(_)) => return Err(AuthError::Disabled),
+                _ => {}
+            }
+        }
+        match crate::ldap::authenticate(&cfg, &user, &password).await {
+            Ok(crate::ldap::Outcome::Valid(u)) => match crate::ldap::resolve_account(state, &cfg, &user, &u).await {
+                Ok(a) => {
+                    state.creds.put(&user, &password, &fp, a.id);
+                    state.limiter.success(ip);
+                    return Ok(a);
+                }
+                Err(AuthError::Invalid) => return Err(record_failure(state, ip, allowlisted, &sec)),
+                Err(e) => return Err(e),
+            },
+            Ok(crate::ldap::Outcome::BadPassword) => return Err(record_failure(state, ip, allowlisted, &sec)),
+            Ok(crate::ldap::Outcome::NotFound) => {}
+            Err(e) => {
+                tracing::warn!("ldap: {e}");
+                if !local {
+                    state.event("warn", "auth", &format!("directory unavailable for sign-in from {ip}: {e}"));
+                    return Err(AuthError::Internal);
+                }
+            }
+        }
+        if !local {
+            return Err(record_failure(state, ip, allowlisted, &sec));
+        }
+    }
+    let email = user;
     let account = state.db.account_by_email(&email).await.map_err(|_| AuthError::Internal)?;
 
     let ok = match &account {
@@ -369,11 +435,7 @@ pub async fn login(state: &State, email: &str, password: &str, ip: IpAddr) -> Re
         }
     };
     if !ok {
-        crate::metrics::AUTH_FAILURES.inc();
-        if !allowlisted && state.limiter.fail(ip, sec.max_auth_failures, sec.auth_failure_window_secs, sec.ban_secs) {
-            state.event("warn", "security", &format!("banned {ip} for {}s after repeated failed logins", sec.ban_secs));
-        }
-        return Err(AuthError::Invalid);
+        return Err(record_failure(state, ip, allowlisted, &sec));
     }
     let account = account.unwrap();
     if !account.active {

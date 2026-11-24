@@ -13,9 +13,11 @@
 //! password). Files, calendars and contacts each have their own store
 //! (`[storage.dav]`), defaulting to the message store's backend.
 pub mod ical;
+pub mod jscal;
 mod locks;
 mod props;
 mod report;
+mod schedule;
 
 use crate::blob::Backend;
 use crate::config::Config;
@@ -312,6 +314,10 @@ pub struct NewNode<'a> {
 impl crate::db::Db {
     pub async fn dav_node(&self, principal: i64, path: &str) -> Result<Option<Node>> {
         let r = sqlx::query(&format!("SELECT {N_COLS} FROM dav_nodes WHERE principal_id = $1 AND path = $2")).bind(principal).bind(path).fetch_optional(&self.pool).await?;
+        r.as_ref().map(node_from).transpose()
+    }
+    pub async fn dav_node_by_id(&self, principal: i64, id: i64) -> Result<Option<Node>> {
+        let r = sqlx::query(&format!("SELECT {N_COLS} FROM dav_nodes WHERE principal_id = $1 AND id = $2")).bind(principal).bind(id).fetch_optional(&self.pool).await?;
         r.as_ref().map(node_from).transpose()
     }
     pub async fn dav_children(&self, principal: i64, parent: &str) -> Result<Vec<Node>> {
@@ -701,7 +707,7 @@ async fn well_known() -> Response {
     (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, "/dav/")]).into_response()
 }
 
-pub const ALLOW: &str = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, COPY, MOVE, LOCK, UNLOCK, REPORT";
+pub const ALLOW: &str = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, COPY, MOVE, LOCK, UNLOCK, REPORT, POST";
 
 fn options() -> Response {
     let mut r = empty(StatusCode::OK);
@@ -788,6 +794,7 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
         "MKCOL" => mkcol(&ctx, &t, &headers, &body, false).await,
         "MKCALENDAR" => mkcol(&ctx, &t, &headers, &body, true).await,
         "COPY" | "MOVE" => copy_move(&ctx, &t, &headers, method.as_str() == "MOVE").await,
+        "POST" if matches!(&t, Target::Node(_, p) if p == schedule::OUTBOX) => schedule::outbox_post(&ctx, &headers, &body).await,
         "POST" => Ok(empty(StatusCode::METHOD_NOT_ALLOWED)),
         _ => Ok(empty(StatusCode::METHOD_NOT_ALLOWED)),
     };
@@ -797,6 +804,80 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
             tracing::warn!("dav {method} {path}: {e:#}");
             empty(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+// ------------------------------------------------------------------ store API (JMAP)
+
+/// Calendars and address books as JMAP for Calendars/Contacts sees them:
+/// the same collections and resources CalDAV and CardDAV serve.
+pub mod store {
+    use super::*;
+
+    /// The account's DAV principal, with its homes (None: DAV is off for it).
+    pub async fn principal(state: &State, acc: &crate::db::Account) -> Result<Option<Principal>> {
+        if !state.settings().dav.enabled {
+            return Ok(None);
+        }
+        let Some(p) = principal_for_account(state, acc).await?.filter(|p| p.active) else { return Ok(None) };
+        ensure_homes(state, &p).await?;
+        Ok(Some(p))
+    }
+
+    /// Store (create or replace) a calendar or vCard resource. Err(reason)
+    /// when it isn't valid there, or doesn't fit the quota.
+    pub async fn put(state: &State, p: &Principal, path: &str, body: &[u8]) -> Result<std::result::Result<Node, String>> {
+        let ctx = Ctx { state: state.clone(), principal: p.clone(), read_only: false, base: String::new() };
+        let parent_path = parent_of(path);
+        let Some(parent) = state.db.dav_node(p.id, &parent_path).await? else { return Ok(Err("No such collection".into())) };
+        if !(parent.is_calendar() || parent.is_addressbook()) {
+            return Ok(Err("Not a calendar or address book".into()));
+        }
+        let existing = state.db.dav_node(p.id, path).await?;
+        let ctype = if parent.is_calendar() { "text/calendar" } else { "text/vcard" };
+        let meta = match validate_content(&ctx, &p.username, &parent, path, ctype, body, existing.as_ref()).await? {
+            Ok(m) => m,
+            Err(r) => return Ok(Err(format!("Refused by the calendar rules ({})", r.status()))),
+        };
+        let old_size = existing.as_ref().map(|n| n.size).unwrap_or(0);
+        let used = state.db.dav_principal_by_id(p.id).await?.map(|x| x.used_bytes).unwrap_or(0);
+        if p.quota_bytes > 0 && used - old_size + body.len() as i64 > p.quota_bytes {
+            return Ok(Err("overQuota".into()));
+        }
+        let section = path.split('/').next().unwrap_or("calendars").to_string();
+        let key = write_blob(state, &section, body).await?;
+        let etag = etag_of(body);
+        let props = existing.as_ref().map(|n| n.props.clone()).unwrap_or_default();
+        let ContentMeta { uid, comp, dtstart, dtend, ctype } = meta;
+        state.db.dav_put(p.id, &NewNode { path, collection: false, kind: "", blob: &key, size: body.len() as i64, etag: &etag, ctype: &ctype, props: &props, uid: &uid, comp: &comp, dtstart, dtend }).await?;
+        if let Some(old) = &existing {
+            delete_blob(state, &section, &old.blob).await;
+        }
+        state.db.dav_usage(p.id, body.len() as i64 - old_size).await?;
+        record_change(state, p.id, path, false).await;
+        Ok(Ok(state.db.dav_node(p.id, path).await?.ok_or_else(|| anyhow::anyhow!("stored node vanished"))?))
+    }
+
+    /// Remove a resource or a whole collection.
+    pub async fn delete(state: &State, p: &Principal, path: &str) -> Result<bool> {
+        let Some(n) = state.db.dav_node(p.id, path).await? else { return Ok(false) };
+        if n.is_home() {
+            return Ok(false);
+        }
+        let ctx = Ctx { state: state.clone(), principal: p.clone(), read_only: false, base: String::new() };
+        remove_tree(&ctx, path).await?;
+        Ok(true)
+    }
+
+    /// Make a calendar ("calendar") or address book ("addressbook").
+    pub async fn make_collection(state: &State, p: &Principal, path: &str, kind: &str, props: &Map<String, Value>) -> Result<()> {
+        state.db.dav_put(p.id, &NewNode { path, collection: true, kind, blob: "", size: 0, etag: "", ctype: "", props, uid: "", comp: "", dtstart: None, dtend: None }).await?;
+        record_change(state, p.id, path, false).await;
+        Ok(())
+    }
+
+    pub async fn read(state: &State, n: &Node) -> Result<String> {
+        Ok(String::from_utf8_lossy(&read_blob(state, n).await?).into_owned())
     }
 }
 
@@ -846,6 +927,31 @@ pub async fn record_change(state: &State, principal: i64, path: &str, deleted: b
         let name = path.rsplit('/').next().unwrap_or("");
         let _ = state.db.dav_change(c.id, name, deleted).await;
     }
+    if !deleted {
+        if let Ok(Some(n)) = state.db.dav_node(principal, path).await {
+            jmap_change(state, principal, &n, "u").await;
+        }
+    }
+}
+
+/// The JMAP kind and id prefix for a DAV node (JMAP Calendars/Contacts).
+pub fn jmap_kind(n: &Node) -> Option<&'static str> {
+    match (n.collection, n.kind.as_str(), n.section()) {
+        (true, "calendar", _) => Some("Calendar"),
+        (true, "addressbook", _) => Some("AddressBook"),
+        (false, _, "calendars") => Some("CalendarEvent"),
+        (false, _, "addressbooks") => Some("ContactCard"),
+        _ => None,
+    }
+}
+
+/// Note a DAV change in the linked account's JMAP change log.
+pub async fn jmap_change(state: &State, principal: i64, n: &Node, op: &str) {
+    let Some(kind) = jmap_kind(n) else { return };
+    let Ok(Some(p)) = state.db.dav_principal_by_id(principal).await else { return };
+    let Some(acc) = p.account_id else { return };
+    let op = if op == "u" && n.created_at == n.updated_at { "c" } else { op };
+    let _ = state.db.log_jmap_change(acc, kind, n.id, op).await;
 }
 
 fn header_str<'a>(h: &'a HeaderMap, k: &str) -> Option<&'a str> {
@@ -1179,6 +1285,7 @@ async fn remove_tree(ctx: &Ctx, path: &str) -> Result<()> {
     for n in &nodes {
         delete_blob(st, n.section(), &n.blob).await;
         freed += n.size;
+        jmap_change(st, ctx.principal.id, n, "d").await;
     }
     st.db.dav_usage(ctx.principal.id, -freed).await?;
     record_change(st, ctx.principal.id, path, true).await;

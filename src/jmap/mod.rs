@@ -6,8 +6,12 @@
 //! `Authorization: Bearer` with a token holding the `jmap` scope. GETs also
 //! accept a console session cookie (EventSource can't send headers); POSTs
 //! never do, so cookies can't be used for cross-site requests.
+mod blob;
+mod dav;
 mod extra;
 mod mail;
+mod submission;
+mod ws;
 mod rest;
 
 use crate::db::Account;
@@ -29,6 +33,14 @@ pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 pub const QUOTA: &str = "urn:ietf:params:jmap:quota";
 pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 pub const SIEVE: &str = "urn:ietf:params:jmap:sieve";
+pub const BLOB: &str = "urn:ietf:params:jmap:blob";
+pub const MDN: &str = "urn:ietf:params:jmap:mdn";
+pub const WEBSOCKET: &str = "urn:ietf:params:jmap:websocket";
+pub const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
+pub const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+pub const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
+/// Capabilities a request may name in `using`.
+const KNOWN: [&str; 12] = [CORE, MAIL, SUBMISSION, QUOTA, VACATION, SIEVE, BLOB, MDN, WEBSOCKET, CALENDARS, CONTACTS, PRINCIPALS];
 const MAX_CALLS: usize = 64;
 const MAX_REQUEST: usize = 10 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 1000;
@@ -43,6 +55,7 @@ pub fn routes(state: State) -> Router {
         .route("/jmap/upload/{account}/", post(upload).layer(DefaultBodyLimit::max(upload_limit)))
         .route("/jmap/download/{account}/{blob}/{name}", get(download))
         .route("/jmap/eventsource", get(eventsource))
+        .route("/jmap/ws", get(ws::upgrade))
         .with_state(state.clone());
     // The Pinal Mail REST API sits on the same engine.
     jmap.merge(rest::routes(state))
@@ -173,6 +186,12 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
             QUOTA: {},
             VACATION: {},
             SIEVE: {"implementation": "Picacho Server"},
+            BLOB: {},
+            MDN: {},
+            WEBSOCKET: {"url": ws_url(&base), "supportsPush": true},
+            CALENDARS: {},
+            CONTACTS: {},
+            PRINCIPALS: {},
         },
         "accounts": {
             id.clone(): {
@@ -188,9 +207,20 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
                         "emailQuerySortOptions": ["receivedAt", "sentAt", "size", "from", "to", "subject", "hasKeyword"],
                         "mayCreateTopLevelMailbox": true,
                     },
-                    SUBMISSION: {"maxDelayedSend": 0, "submissionExtensions": {}},
+                    SUBMISSION: submission_caps(&state),
                     QUOTA: {},
                     VACATION: {},
+                    BLOB: {
+                        "maxSizeBlobSet": max_upload,
+                        "maxDataSources": blob::MAX_DATA_SOURCES,
+                        "supportedTypeNames": ["Email", "Thread"],
+                        "supportedDigestAlgorithms": ["sha", "sha-256"],
+                    },
+                    MDN: {},
+                    CALENDARS: {"maxCalendarsPerEvent": 1, "minDateTime": "1970-01-01T00:00:00", "maxDateTime": "2200-01-01T00:00:00",
+                        "maxExpandedQueryDuration": "P400D", "maxParticipantsPerEvent": 1000, "mayCreateCalendar": true},
+                    CONTACTS: {"maxAddressBooksPerCard": 1, "mayCreateAddressBook": true},
+                    PRINCIPALS: {"currentUserPrincipalId": format!("P{}", a.id)},
                     SIEVE: {
                         "maxSizeScriptName": 128,
                         "maxSizeScript": crate::sieve::MAX_SCRIPT_BYTES,
@@ -203,7 +233,7 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
                 },
             },
         },
-        "primaryAccounts": {MAIL: id, SUBMISSION: id, QUOTA: id, CORE: id, VACATION: id, SIEVE: id},
+        "primaryAccounts": {MAIL: id, SUBMISSION: id, QUOTA: id, CORE: id, VACATION: id, SIEVE: id, BLOB: id, MDN: id, CALENDARS: id, CONTACTS: id, PRINCIPALS: id},
         "username": a.email,
         "apiUrl": format!("{base}/jmap/api"),
         "downloadUrl": format!("{base}/jmap/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}"),
@@ -212,6 +242,29 @@ async fn session(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
         "state": jstate.to_string(),
     }))
     .into_response()
+}
+
+/// `wss://` (or `ws://` for local http) for the WebSocket endpoint.
+fn ws_url(base: &str) -> String {
+    let rest = base.strip_prefix("https://").map(|r| format!("wss://{r}")).or_else(|| base.strip_prefix("http://").map(|r| format!("ws://{r}")));
+    format!("{}/jmap/ws", rest.unwrap_or_else(|| base.to_string()))
+}
+
+/// The submission capability: holding for later (FUTURERELEASE) and the
+/// envelope parameters EmailSubmission accepts.
+fn submission_caps(state: &State) -> Value {
+    let hold = crate::submit::max_hold_secs(state);
+    let mut ext = serde_json::Map::new();
+    ext.insert("DSN".into(), json!([]));
+    ext.insert("REQUIRETLS".into(), json!([]));
+    ext.insert("DELIVERBY".into(), json!(["60"]));
+    ext.insert("MT-PRIORITY".into(), json!(["MIXER"]));
+    ext.insert("SIZE".into(), json!([state.settings().limits.max_message_bytes.to_string()]));
+    if hold > 0 {
+        let until = chrono::Utc::now() + chrono::Duration::seconds(hold);
+        ext.insert("FUTURERELEASE".into(), json!([hold.to_string(), until.format("%Y-%m-%dT%H:%M:%SZ").to_string()]));
+    }
+    json!({"maxDelayedSend": hold, "submissionExtensions": ext})
 }
 
 /// A method error (`["error", {...}, callId]`).
@@ -322,17 +375,26 @@ async fn api(
         Ok(v) => v,
         Err(e) => return problem(StatusCode::BAD_REQUEST, "urn:ietf:params:jmap:error:notJSON", &e.to_string()),
     };
+    match process(&state, account, level, &req).await {
+        Ok(out) => Json(out).into_response(),
+        Err((kind, detail)) => problem(StatusCode::BAD_REQUEST, kind, &detail),
+    }
+}
+
+/// Run a JMAP request object (HTTP POST or a WebSocket Request). An error
+/// is a request-level problem: (type, detail).
+pub async fn process(state: &State, account: Account, level: crate::auth::Access, req: &Value) -> Result<Value, (&'static str, String)> {
     let (Some(using), Some(calls)) = (req.get("using").and_then(|v| v.as_array()), req.get("methodCalls").and_then(|v| v.as_array())) else {
-        return problem(StatusCode::BAD_REQUEST, "urn:ietf:params:jmap:error:notRequest", "using and methodCalls are required");
+        return Err(("urn:ietf:params:jmap:error:notRequest", "using and methodCalls are required".into()));
     };
     let using: Vec<String> = using.iter().filter_map(|u| u.as_str().map(String::from)).collect();
     for u in &using {
-        if ![CORE, MAIL, SUBMISSION, QUOTA, VACATION, SIEVE].contains(&u.as_str()) {
-            return problem(StatusCode::BAD_REQUEST, "urn:ietf:params:jmap:error:unknownCapability", &format!("Unknown capability {u}"));
+        if !KNOWN.contains(&u.as_str()) {
+            return Err(("urn:ietf:params:jmap:error:unknownCapability", format!("Unknown capability {u}")));
         }
     }
     if calls.len() > MAX_CALLS {
-        return problem(StatusCode::BAD_REQUEST, "urn:ietf:params:jmap:error:limit", "Too many method calls");
+        return Err(("urn:ietf:params:jmap:error:limit", "Too many method calls".into()));
     }
     let mut ctx = Ctx { state: state.clone(), account, created: HashMap::new(), using, read_only: level == crate::auth::Access::Read };
     if let Some(c) = req.get("createdIds").and_then(|v| v.as_object()) {
@@ -345,7 +407,7 @@ async fn api(
     let mut responses: Vec<Value> = vec![];
     for call in calls {
         let (Some(name), Some(args), Some(call_id)) = (call.get(0).and_then(|v| v.as_str()), call.get(1), call.get(2).and_then(|v| v.as_str())) else {
-            return problem(StatusCode::BAD_REQUEST, "urn:ietf:params:jmap:error:notRequest", "Malformed method call");
+            return Err(("urn:ietf:params:jmap:error:notRequest", "Malformed method call".into()));
         };
         let mut args = match args.as_object() {
             Some(o) => o.clone(),
@@ -373,7 +435,7 @@ async fn api(
     if req.get("createdIds").is_some() {
         out["createdIds"] = json!(ctx.created);
     }
-    Json(out).into_response()
+    Ok(out)
 }
 
 async fn upload(

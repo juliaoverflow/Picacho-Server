@@ -60,6 +60,11 @@ impl AppState {
         let live = settings_backend.load().await?;
         let hostname = live.server.hostname.clone().unwrap_or_else(|| config.default_hostname());
         let tls = crate::tls::load(&config, &hostname)?;
+        if let Some(k) = config.kerberos.as_ref().filter(|k| k.enabled) {
+            if let Err(e) = crate::gssapi::init(&k.keytab) {
+                tracing::warn!("kerberos: {e:#}; GSSAPI won't be offered");
+            }
+        }
         let resolver = match config.dns.resolver.as_deref() {
             Some("cloudflare") => mail_auth::MessageAuthenticator::new_cloudflare().ok(),
             Some("google") => mail_auth::MessageAuthenticator::new_google().ok(),

@@ -93,6 +93,8 @@ pub enum Proto {
     Submission,
     Submissions,
     ManageSieve,
+    Pop3,
+    Pop3s,
 }
 
 impl Proto {
@@ -104,10 +106,12 @@ impl Proto {
             Proto::Submission => "Submission",
             Proto::Submissions => "Submissions",
             Proto::ManageSieve => "ManageSieve",
+            Proto::Pop3 => "POP3",
+            Proto::Pop3s => "POP3S",
         }
     }
     fn implicit_tls(self) -> bool {
-        matches!(self, Proto::Imaps | Proto::Submissions)
+        matches!(self, Proto::Imaps | Proto::Submissions | Proto::Pop3s)
     }
 }
 
@@ -133,7 +137,7 @@ pub async fn spawn_listener(state: State, addr: SocketAddr, proto: Proto) -> Res
             };
             let _ = tcp.set_nodelay(true);
             let limits = &state.config.limits;
-            let kind = if matches!(proto, Proto::Imap | Proto::Imaps) { "imap" } else { "smtp" };
+            let kind = if matches!(proto, Proto::Imap | Proto::Imaps | Proto::Pop3 | Proto::Pop3s) { "imap" } else { "smtp" };
             let Some(guard) = state.conns.acquire(peer.ip(), limits.max_connections, limits.max_connections_per_ip, kind) else {
                 tracing::warn!("connection limit reached; refusing {peer} ({} open)", state.conns.total());
                 drop(tcp);
@@ -158,6 +162,7 @@ pub async fn spawn_listener(state: State, addr: SocketAddr, proto: Proto) -> Res
                         crate::smtp::handle(state, stream, peer, crate::smtp::Mode::Submission).await
                     }
                     Proto::ManageSieve => crate::sieve::managesieve::handle(state, stream, peer).await,
+                    Proto::Pop3 | Proto::Pop3s => crate::pop3::handle(state, stream, peer).await,
                 }
             });
         }

@@ -133,9 +133,9 @@ pub async fn serve(state: State, addr: SocketAddr) -> Result<SocketAddr, String>
                     let Ok(Ok(s)) = tokio::time::timeout(std::time::Duration::from_secs(15), state.tls.acceptor.accept(tcp)).await else {
                         return;
                     };
-                    let _ = builder.serve_connection(TokioIo::new(s), svc).await;
+                    let _ = builder.serve_connection_with_upgrades(TokioIo::new(s), svc).await;
                 } else {
-                    let _ = builder.serve_connection(TokioIo::new(tcp), svc).await;
+                    let _ = builder.serve_connection_with_upgrades(TokioIo::new(tcp), svc).await;
                 }
             });
         }

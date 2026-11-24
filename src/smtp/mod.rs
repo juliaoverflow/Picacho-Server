@@ -44,6 +44,8 @@ struct Session {
     bdat_too_big: bool,
     /// Listed on a score-only DNSBL.
     dnsbl_hit: Option<String>,
+    /// FUTURERELEASE (RFC 4865): hold the message until then.
+    hold: Option<i64>,
 }
 
 pub async fn handle(state: State, stream: Stream, peer: SocketAddr, mode: Mode) {
@@ -68,6 +70,7 @@ pub async fn handle(state: State, stream: Stream, peer: SocketAddr, mode: Mode) 
         bdat: None,
         bdat_too_big: false,
         dnsbl_hit: None,
+        hold: None,
     };
     if let Err(e) = s.run().await {
         tracing::debug!("smtp session {}: {e:#}", s.peer);
@@ -195,6 +198,7 @@ impl Session {
                 "RCPT" => self.rcpt(&arg).await,
                 "DATA" => self.data().await?,
                 "BDAT" => self.bdat(&arg).await?,
+                "BURL" => self.burl(&arg).await?,
                 "RSET" => {
                     self.reset();
                     self.reply(250, "2.0.0 OK");
@@ -244,14 +248,30 @@ impl Session {
             "SMTPUTF8".into(),
             "DSN".into(),
             "CHUNKING".into(),
+            "BINARYMIME".into(),
+            "DELIVERBY 60".into(),
+            "MT-PRIORITY MIXER".into(),
         ];
         if !self.tls() {
             lines.push("STARTTLS".into());
         } else {
             lines.push("REQUIRETLS".into());
         }
+        // RFC 4468: signed-in users may send a message from their own IMAP
+        // mailboxes by URL (URLAUTH `submit+`).
+        if self.mode == Mode::Submission && self.account.is_some() {
+            lines.push("BURL imap".into());
+        }
+        // RFC 9422: how many recipients one message may have.
+        lines.push(format!("LIMITS RCPTMAX={} RCPTDOMAINMAX={}", self.state.settings().limits.max_recipients, self.state.settings().limits.max_recipients));
+        // RFC 4865: submissions may be held at the server and released later.
+        let hold = crate::submit::max_hold_secs(&self.state);
+        if self.mode == Mode::Submission && hold > 0 {
+            let until = chrono::Utc::now() + chrono::Duration::seconds(hold);
+            lines.push(format!("FUTURERELEASE {hold} {}", until.format("%Y-%m-%dT%H:%M:%SZ")));
+        }
         if self.account.is_none() && self.auth_allowed() {
-            lines.push("AUTH PLAIN LOGIN XOAUTH2 OAUTHBEARER".into());
+            lines.push(if crate::gssapi::available(&self.state) { "AUTH PLAIN LOGIN XOAUTH2 OAUTHBEARER GSSAPI" } else { "AUTH PLAIN LOGIN XOAUTH2 OAUTHBEARER" }.into());
         }
         self.reply(250, &lines.join("\n"));
     }
@@ -277,6 +297,9 @@ impl Session {
         let mut it = arg.split_whitespace();
         let mech = it.next().unwrap_or("").to_ascii_uppercase();
         let initial = it.next().map(|s| s.to_string());
+        if mech == "GSSAPI" && crate::gssapi::available(&self.state) {
+            return self.auth_gssapi(initial).await;
+        }
         let (user, pass) = match mech.as_str() {
             "PLAIN" => {
                 let data = match initial {
@@ -360,6 +383,54 @@ impl Session {
         Ok(())
     }
 
+    /// SASL GSSAPI (RFC 4752): Kerberos sign-in.
+    async fn auth_gssapi(&mut self, initial: Option<String>) -> anyhow::Result<()> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let Ok(mut ex) = crate::gssapi::Exchange::new() else {
+            self.reply(454, "4.7.0 Kerberos isn't available");
+            return Ok(());
+        };
+        let mut input = match initial {
+            Some(d) if d == "=" => String::new(),
+            Some(d) => d,
+            None => match self.challenge("").await? {
+                Some(d) => d,
+                None => return Ok(()),
+            },
+        };
+        loop {
+            let Ok(raw) = b64.decode(input.trim()) else {
+                self.reply(501, "5.5.2 Invalid base64");
+                return Ok(());
+            };
+            match ex.step(&raw) {
+                Ok(crate::gssapi::Step::Continue(out)) => {
+                    input = match self.challenge(&b64.encode(out)).await? {
+                        Some(d) => d,
+                        None => return Ok(()),
+                    };
+                }
+                Ok(crate::gssapi::Step::Done { principal, authzid }) => {
+                    match crate::gssapi::account_for(&self.state, &principal, &authzid).await {
+                        Some(a) => {
+                            self.state.event("info", "auth", &format!("smtp kerberos login {principal} as {} from {}", a.email, self.peer));
+                            self.account = Some(a);
+                            self.reply(235, "2.7.0 Authentication successful");
+                        }
+                        None => self.reply(535, "5.7.8 This Kerberos principal has no mailbox here"),
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("gssapi: {e:#}");
+                    crate::metrics::AUTH_FAILURES.inc();
+                    self.reply(535, "5.7.8 Kerberos authentication failed");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     async fn challenge(&mut self, prompt: &str) -> anyhow::Result<Option<String>> {
         self.conn.push(&format!("334 {prompt}\r\n"));
         self.conn.flush().await?;
@@ -417,9 +488,54 @@ impl Session {
         };
         self.dsn = Default::default();
         self.requiretls = false;
+        self.hold = None;
         let max = self.state.settings().limits.max_message_bytes;
         for (k, v) in &params {
             match k.as_str() {
+                // RFC 2852: BY=<seconds>;<R|N>[T]
+                "BY" => {
+                    let (n, mode) = v.split_once(';').unwrap_or((v.as_str(), ""));
+                    let mode = mode.to_ascii_uppercase();
+                    let secs: Option<i64> = n.parse().ok();
+                    match (secs, mode.trim_end_matches('T')) {
+                        (Some(s), "R") if s > 0 => {
+                            self.dsn.by = Some(crate::util::now() + s);
+                            self.dsn.by_mode = "R".into();
+                        }
+                        (Some(s), "N") => {
+                            self.dsn.by = Some(crate::util::now() + s);
+                            self.dsn.by_mode = "N".into();
+                        }
+                        _ => {
+                            self.reply(501, "5.5.4 BY needs <seconds>;R or <seconds>;N (R needs a positive time)");
+                            return;
+                        }
+                    }
+                }
+                "MT-PRIORITY" => match v.parse::<i8>() {
+                    Ok(p) if (-9..=9).contains(&p) => self.dsn.priority = Some(if self.account.is_some() { p } else { p.min(0) }),
+                    _ => {
+                        self.reply(501, "5.5.4 MT-PRIORITY must be -9 to 9");
+                        return;
+                    }
+                },
+                "HOLDFOR" | "HOLDUNTIL" => {
+                    if self.account.is_none() || self.mode != Mode::Submission {
+                        self.reply(554, "5.7.1 Only authenticated submissions may be held for later");
+                        return;
+                    }
+                    if self.hold.is_some() {
+                        self.reply(501, "5.5.4 Only one of HOLDFOR and HOLDUNTIL");
+                        return;
+                    }
+                    match crate::submit::hold_time(&self.state, k, v) {
+                        Ok(t) => self.hold = Some(t),
+                        Err(e) => {
+                            self.reply(501, &format!("5.5.4 {e}"));
+                            return;
+                        }
+                    }
+                }
                 "SIZE" => {
                     if v.parse::<u64>().map(|s| s > max).unwrap_or(true) {
                         self.reply(552, "5.3.4 Message size exceeds fixed maximum message size");
@@ -427,7 +543,7 @@ impl Session {
                     }
                 }
                 "BODY" => {
-                    if !matches!(v.to_ascii_uppercase().as_str(), "7BIT" | "8BITMIME") {
+                    if !matches!(v.to_ascii_uppercase().as_str(), "7BIT" | "8BITMIME" | "BINARYMIME") {
                         self.reply(555, "5.5.4 Unsupported BODY type");
                         return;
                     }
@@ -500,25 +616,13 @@ impl Session {
         self.rcpts.clear();
         self.dsn = Default::default();
         self.requiretls = false;
+        self.hold = None;
         self.bdat = None;
         self.bdat_too_big = false;
     }
 
     async fn owns_address(&self, acc: &Account, sender: &str) -> bool {
-        if sender.is_empty() || sender == acc.email {
-            return true;
-        }
-        if let Some((l, d)) = sender.rsplit_once('@') {
-            if let Some((base, _)) = l.split_once('+') {
-                if format!("{base}@{d}") == acc.email {
-                    return true;
-                }
-            }
-        }
-        match self.state.db.alias_by_source(sender).await {
-            Ok(Some(a)) => a.destination.split([',', ' ']).any(|d| d.trim().eq_ignore_ascii_case(&acc.email)),
-            _ => false,
-        }
+        crate::submit::owns_address(&self.state, acc, sender).await
     }
 
     async fn rcpt(&mut self, arg: &str) {
@@ -658,6 +762,55 @@ impl Session {
         }
     }
 
+    /// BURL <imap-url> [LAST] (RFC 4468): a piece of the message fetched
+    /// from an authorized IMAP URL instead of sent. Mixes with BDAT.
+    async fn burl(&mut self, arg: &str) -> anyhow::Result<()> {
+        let mut it = arg.split_whitespace();
+        let url = it.next().unwrap_or("");
+        let last = it.next().is_some_and(|l| l.eq_ignore_ascii_case("LAST"));
+        let Some(acc) = self.account.clone().filter(|_| self.mode == Mode::Submission) else {
+            self.reply(530, "5.7.0 Authentication required for BURL");
+            return Ok(());
+        };
+        if self.from.is_none() {
+            self.reply(503, "5.5.1 MAIL first");
+            return Ok(());
+        }
+        if self.rcpts.is_empty() {
+            self.reply(554, "5.5.1 No valid recipients");
+            return Ok(());
+        }
+        if !url.to_ascii_lowercase().starts_with("imap://") {
+            self.reply(554, "5.7.8 Only imap URLs are supported");
+            return Ok(());
+        }
+        let Some(data) = crate::imap::urlauth::fetch(&self.state, url, Some(&acc), true).await? else {
+            self.reply(554, "5.6.6 The IMAP URL couldn't be resolved or isn't authorized for you");
+            return Ok(());
+        };
+        let max = self.state.settings().limits.max_message_bytes as usize;
+        let buf = self.bdat.get_or_insert_with(Vec::new);
+        if buf.len() + data.len() > max {
+            self.bdat_too_big = true;
+        } else {
+            buf.extend_from_slice(&data);
+        }
+        if !last {
+            self.reply(250, &format!("2.5.0 {} octets received", data.len()));
+            return Ok(());
+        }
+        if self.bdat_too_big {
+            self.reset();
+            self.reply(552, "5.3.4 Message size exceeds fixed maximum message size");
+            return Ok(());
+        }
+        let body = crate::util::normalize_crlf(&self.bdat.take().unwrap_or_default());
+        let result = self.accept_message(body).await;
+        self.reset();
+        self.finish(result);
+        Ok(())
+    }
+
     /// BDAT <size> [LAST] (RFC 3030). The chunk is always read, even when
     /// the command is refused, to stay in sync with the client.
     async fn bdat(&mut self, arg: &str) -> anyhow::Result<()> {
@@ -767,6 +920,26 @@ impl Session {
             received.push_str(&format!("\r\n\tfor <{}>", self.rcpts[0].0));
         }
         received.push_str(&format!(";\r\n\t{date}\r\n"));
+
+        // FUTURERELEASE: keep the whole message, for every recipient, until
+        // its time (local recipients too: they mustn't see it early).
+        if let (Some(at), Some(acc)) = (self.hold, self.account.clone()) {
+            let mut message = received.clone().into_bytes();
+            message.extend_from_slice(&body);
+            let o = crate::submit::Outgoing {
+                identity: String::new(),
+                email_id: 0,
+                thread_id: 0,
+                sender: sender.clone(),
+                rcpts: self.rcpts.iter().map(|r| r.0.clone()).collect(),
+                message,
+                dsn: self.dsn.clone(),
+                requiretls: self.requiretls,
+                hold_until: Some(at),
+            };
+            let s = crate::submit::submit(&self.state, &acc, o).await.map_err(DataError::Internal)?;
+            return Ok(format!("{id}, held until {} as submission s{}", s.send_at, s.id));
+        }
 
         // Group targets.
         let mut local: BTreeSet<i64> = BTreeSet::new();

@@ -126,7 +126,7 @@ impl Session {
         let host = self.state.hostname();
         self.conn.push("\"IMPLEMENTATION\" \"Picacho Server\"\r\n");
         if self.account.is_none() && self.auth_ok() {
-            self.conn.push("\"SASL\" \"PLAIN OAUTHBEARER XOAUTH2\"\r\n");
+            self.conn.push(if crate::gssapi::available(&self.state) { "\"SASL\" \"PLAIN OAUTHBEARER XOAUTH2 GSSAPI\"\r\n" } else { "\"SASL\" \"PLAIN OAUTHBEARER XOAUTH2\"\r\n" });
         } else if self.account.is_none() {
             self.conn.push("\"SASL\" \"\"\r\n");
         }
@@ -135,6 +135,70 @@ impl Session {
             self.conn.push("\"STARTTLS\"\r\n");
         }
         self.conn.push(&format!("\"MAXREDIRECTS\" \"8\"\r\n\"NOTIFY\" \"\"\r\n\"VERSION\" \"1.0\"\r\n\"OWNER\" {}\r\n", quote(self.account.as_ref().map(|a| a.email.as_str()).unwrap_or(&host))));
+    }
+
+    /// A SASL continuation (a quoted base64 string), the client's answer back.
+    async fn sasl_step(&mut self, data: &str) -> anyhow::Result<Option<String>> {
+        self.conn.push(&format!("{}\r\n", quote(data)));
+        self.conn.flush().await?;
+        let Ok(line) = self.read_cmd().await else { return Ok(None) };
+        let toks = tokenize(&line).unwrap_or_default();
+        Ok(match toks.first() {
+            Some(t) if t.text() == "*" => None,
+            Some(t) => Some(t.text().to_string()),
+            None => Some(String::new()),
+        })
+    }
+
+    /// SASL GSSAPI (RFC 4752): Kerberos sign-in.
+    async fn auth_gssapi(&mut self, initial: Option<String>) -> anyhow::Result<()> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let Ok(mut ex) = crate::gssapi::Exchange::new() else {
+            self.no("Kerberos isn't available.");
+            return Ok(());
+        };
+        let mut input = match initial {
+            Some(i) => i,
+            None => match self.sasl_step("").await? {
+                Some(i) => i,
+                None => {
+                    self.no("Authentication cancelled.");
+                    return Ok(());
+                }
+            },
+        };
+        loop {
+            let Ok(raw) = b64.decode(input.trim()) else {
+                self.no("Invalid base64.");
+                return Ok(());
+            };
+            match ex.step(&raw) {
+                Ok(crate::gssapi::Step::Continue(out)) => match self.sasl_step(&b64.encode(out)).await? {
+                    Some(i) => input = i,
+                    None => {
+                        self.no("Authentication cancelled.");
+                        return Ok(());
+                    }
+                },
+                Ok(crate::gssapi::Step::Done { principal, authzid }) => {
+                    match crate::gssapi::account_for(&self.state, &principal, &authzid).await {
+                        Some(a) => {
+                            self.state.event("info", "auth", &format!("managesieve kerberos login {principal} as {} from {}", a.email, self.peer));
+                            self.account = Some(a);
+                            self.ok("Logged in.");
+                        }
+                        None => self.no("This Kerberos principal has no mailbox here."),
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("gssapi: {e:#}");
+                    crate::metrics::AUTH_FAILURES.inc();
+                    self.no("Kerberos authentication failed.");
+                    return Ok(());
+                }
+            }
+        }
     }
 
     async fn read_cmd(&mut self) -> Result<Vec<u8>, ReadError> {
@@ -361,6 +425,9 @@ impl Session {
             return Ok(());
         }
         let mech = args.first().map(|m| m.to_ascii_uppercase()).unwrap_or_default();
+        if mech == "GSSAPI" && crate::gssapi::available(&self.state) {
+            return self.auth_gssapi(args.get(1).cloned()).await;
+        }
         let initial = match args.get(1) {
             Some(i) => i.clone(),
             None => {

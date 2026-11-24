@@ -78,7 +78,7 @@ fn writable(ns: &str, name: &str) -> Option<&'static str> {
 
 fn protected(ns: &str, name: &str) -> bool {
     LIVE.iter().any(|(n, x)| *n == ns && *x == name && name != "displayname")
-        || matches!((ns, name), (CALDAV, "supported-calendar-component-set") | (CALDAV, "supported-calendar-data") | (CALDAV, "max-resource-size") | (CARDDAV, "supported-address-data") | (CARDDAV, "max-resource-size") | (CALDAV, "calendar-home-set") | (CARDDAV, "addressbook-home-set") | (DAV, "principal-URL"))
+        || matches!((ns, name), (CALDAV, "supported-calendar-component-set") | (CALDAV, "supported-calendar-data") | (CALDAV, "max-resource-size") | (CARDDAV, "supported-address-data") | (CARDDAV, "max-resource-size") | (CALDAV, "calendar-home-set") | (CARDDAV, "addressbook-home-set") | (DAV, "principal-URL") | (CALDAV, "schedule-outbox-URL"))
 }
 
 fn dead_key(ns: &str, name: &str) -> String {
@@ -333,6 +333,15 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
                     w.text_el(DAV, "href", &format!("mailto:{email}"));
                     w.text_el(DAV, "href", &href_principal(&p.username));
                 }
+                w.close(ns, name);
+            }
+            _ => return false,
+        },
+        // RFC 6638: where free/busy requests are POSTed (see schedule.rs).
+        (CALDAV, "schedule-outbox-URL") => match res {
+            Res::Principal(p) => {
+                w.open(ns, name);
+                w.text_el(DAV, "href", &format!("/dav/calendars/{}/outbox/", pct_encode(&p.username)));
                 w.close(ns, name);
             }
             _ => return false,

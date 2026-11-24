@@ -28,17 +28,37 @@ pub async fn call(ctx: &mut Ctx, name: &str, args: &Value) -> R {
     if name.starts_with("VacationResponse/") || name.starts_with("SieveScript/") {
         return super::extra::call(ctx, name, args).await;
     }
+    // JMAP for Calendars and Contacts, and Principals (RFC 9670).
+    let dav_cap = match name.split('/').next().unwrap_or("") {
+        "Calendar" | "CalendarEvent" | "ParticipantIdentity" | "CalendarEventNotification" => Some(super::CALENDARS),
+        "AddressBook" | "ContactCard" => Some(super::CONTACTS),
+        "Principal" | "ShareNotification" => Some(super::PRINCIPALS),
+        _ => None,
+    };
+    if let Some(cap) = dav_cap {
+        need(cap)?;
+        ctx.check_account(args)?;
+        if ctx.read_only && (name.ends_with("/set") || name.ends_with("/copy")) {
+            return Err(MethodError("forbidden", "This token has read-only access.".into()));
+        }
+        return super::dav::call(ctx, name, args).await;
+    }
     match name {
         "Mailbox/get" | "Mailbox/changes" | "Mailbox/query" | "Mailbox/queryChanges" | "Mailbox/set" | "Email/get"
         | "Email/changes" | "Email/query" | "Email/queryChanges" | "Email/set" | "Email/import" | "Thread/get"
         | "Thread/changes" | "SearchSnippet/get" => need(super::MAIL)?,
-        "Identity/get" | "Identity/changes" | "EmailSubmission/get" | "EmailSubmission/set" | "EmailSubmission/query"
+        "Identity/get" | "Identity/set" | "Identity/changes" | "EmailSubmission/get" | "EmailSubmission/set" | "EmailSubmission/query"
         | "EmailSubmission/changes" => need(super::SUBMISSION)?,
         "Quota/get" | "Quota/changes" => need(super::QUOTA)?,
+        "Blob/upload" | "Blob/get" | "Blob/lookup" => need(super::BLOB)?,
+        "Email/parse" | "Email/copy" | "Blob/copy" => need(super::MAIL)?,
+        "MDN/send" | "MDN/parse" => need(super::MDN)?,
+        "Quota/query" => need(super::QUOTA)?,
+        "EmailSubmission/queryChanges" => need(super::SUBMISSION)?,
         _ => return Err(MethodError("unknownMethod", format!("Unknown method {name}"))),
     }
     ctx.check_account(args)?;
-    if ctx.read_only && matches!(name, "Mailbox/set" | "Email/set" | "Email/import" | "EmailSubmission/set") {
+    if ctx.read_only && matches!(name, "Mailbox/set" | "Email/set" | "Email/import" | "EmailSubmission/set" | "Identity/set" | "Blob/upload" | "MDN/send") {
         return Err(MethodError("forbidden", "This token has read-only access.".into()));
     }
     let one = |v: Value| Ok(vec![(name.to_string(), v)]);
@@ -55,38 +75,48 @@ pub async fn call(ctx: &mut Ctx, name: &str, args: &Value) -> R {
         "Thread/get" => one(thread_get(ctx, args).await?),
         "Thread/changes" => one(changes(ctx, args, "Thread").await?),
         "SearchSnippet/get" => one(snippets(ctx, args).await?),
-        "Identity/get" => one(identity_get(ctx, args).await?),
-        "Identity/changes" | "EmailSubmission/changes" | "Quota/changes" => {
+        "Identity/get" => one(super::submission::identity_get(ctx, args).await?),
+        "Identity/set" => one(super::submission::identity_set(ctx, args).await?),
+        "Identity/changes" => one(changes(ctx, args, "Identity").await?),
+        "EmailSubmission/changes" => one(changes(ctx, args, "EmailSubmission").await?),
+        "Quota/changes" => {
             let st = state_str(ctx).await?;
             let since = args.get("sinceState").and_then(|v| v.as_str()).unwrap_or("");
             one(json!({"accountId": account_id(&ctx.account), "oldState": since, "newState": st,
                 "hasMoreChanges": false, "created": [], "updated": [], "destroyed": []}))
         }
-        "EmailSubmission/get" => {
-            let st = state_str(ctx).await?;
-            let ids: Vec<Value> = args.get("ids").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            one(json!({"accountId": account_id(&ctx.account), "state": st, "list": [], "notFound": ids}))
+        "EmailSubmission/get" => one(super::submission::submission_get(ctx, args).await?),
+        "EmailSubmission/query" => one(super::submission::submission_query(ctx, args).await?),
+        "EmailSubmission/set" => super::submission::submission_set(ctx, args).await,
+        "Blob/upload" => one(super::blob::blob_upload(ctx, args).await?),
+        "Blob/get" => one(super::blob::blob_get(ctx, args).await?),
+        "Blob/lookup" => one(super::blob::blob_lookup(ctx, args).await?),
+        "MDN/parse" => one(super::blob::mdn_parse(ctx, args).await?),
+        "Quota/query" => {
+            let types: Vec<String> = args.get("filter").and_then(|f| f.get("types")).and_then(|t| t.as_array()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+            let ids: Vec<&str> = if types.is_empty() || types.iter().any(|t| t == "Email" || t == "Mail") { vec!["q0"] } else { vec![] };
+            one(json!({"accountId": account_id(&ctx.account), "queryState": state_str(ctx).await?, "canCalculateChanges": false, "position": 0, "ids": ids, "total": ids.len()}))
         }
-        "EmailSubmission/query" => {
-            let st = state_str(ctx).await?;
-            one(json!({"accountId": account_id(&ctx.account), "queryState": st, "canCalculateChanges": false, "position": 0, "ids": [], "total": 0}))
-        }
-        "EmailSubmission/set" => submission_set(ctx, args).await,
+        // One account per sign-in: there's nowhere else to copy from.
+        "Email/copy" | "Blob/copy" => Err(MethodError("fromAccountNotFound", "This sign-in reaches only its own account.".into())),
+        "Mailbox/queryChanges" | "EmailSubmission/queryChanges" => Err(MethodError("cannotCalculateChanges", "Run the query again.".into())),
+        "Email/parse" => one(super::blob::email_parse(ctx, args).await?),
+        "MDN/send" => super::blob::mdn_send(ctx, args).await,
         "Quota/get" => one(quota_get(ctx, args).await?),
-        "Mailbox/queryChanges" | "Email/queryChanges" => Err(MethodError("cannotCalculateChanges", "Run the query again.".into())),
+        "Email/queryChanges" => one(email_query_changes(ctx, args).await?),
         _ => unreachable!(),
     }
 }
 
-async fn state_str(ctx: &Ctx) -> Result<String, MethodError> {
+pub(super) async fn state_str(ctx: &Ctx) -> Result<String, MethodError> {
     Ok(ctx.state.db.jmap_state(ctx.account.id).await?.to_string())
 }
 
-fn num_id(s: &str, prefix: char) -> Option<i64> {
+pub(super) fn num_id(s: &str, prefix: char) -> Option<i64> {
     s.strip_prefix(prefix)?.parse().ok()
 }
 
-fn utc(ts: i64) -> String {
+pub(super) fn utc(ts: i64) -> String {
     use chrono::TimeZone;
     chrono::Utc.timestamp_opt(ts, 0).single().unwrap_or_default().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
@@ -96,7 +126,7 @@ fn parse_utc(s: &str) -> Option<i64> {
 }
 
 /// Requested ids (`null` means all) and the properties to return.
-fn ids_arg(ctx: &Ctx, args: &Value) -> Result<Option<Vec<String>>, MethodError> {
+pub(super) fn ids_arg(ctx: &Ctx, args: &Value) -> Result<Option<Vec<String>>, MethodError> {
     match args.get("ids") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(a)) => {
@@ -109,7 +139,7 @@ fn ids_arg(ctx: &Ctx, args: &Value) -> Result<Option<Vec<String>>, MethodError> 
     }
 }
 
-fn props_arg(args: &Value, default: &[&str]) -> Vec<String> {
+pub(super) fn props_arg(args: &Value, default: &[&str]) -> Vec<String> {
     match args.get("properties").and_then(|v| v.as_array()) {
         Some(p) => {
             let mut v: Vec<String> = p.iter().filter_map(|x| x.as_str().map(String::from)).collect();
@@ -122,7 +152,7 @@ fn props_arg(args: &Value, default: &[&str]) -> Vec<String> {
     }
 }
 
-fn pick(obj: Map<String, Value>, props: &[String]) -> Value {
+pub(super) fn pick(obj: Map<String, Value>, props: &[String]) -> Value {
     Value::Object(obj.into_iter().filter(|(k, _)| props.iter().any(|p| p == k)).collect())
 }
 
@@ -274,7 +304,15 @@ async fn changes(ctx: &mut Ctx, args: &Value, kind: &str) -> Result<Value, Metho
     let prefix = match kind {
         "Mailbox" => "m",
         "Thread" => "t",
+        "EmailSubmission" => "s",
+        "Identity" => "j",
         _ => "e",
+    };
+    // Built-in identities' settings are rows too, but keep their own ids.
+    let builtin: HashMap<i64, String> = if kind == "Identity" {
+        ctx.state.db.identities(ctx.account.id).await?.into_iter().filter(|r| !r.builtin.is_empty()).map(|r| (r.id, r.builtin)).collect()
+    } else {
+        HashMap::new()
     };
     let mut first_op: HashMap<i64, String> = HashMap::new();
     let mut last_op: HashMap<i64, String> = HashMap::new();
@@ -289,7 +327,9 @@ async fn changes(ctx: &mut Ctx, args: &Value, kind: &str) -> Result<Value, Metho
     let (mut created, mut updated, mut destroyed) = (vec![], vec![], vec![]);
     for id in order {
         let (f, l) = (first_op[&id].as_str(), last_op[&id].as_str());
-        let sid = format!("{prefix}{id}");
+        let sid = builtin.get(&id).cloned().unwrap_or_else(|| format!("{prefix}{id}"));
+        // A built-in identity existed before its settings row did.
+        let f = if f == "c" && builtin.contains_key(&id) { "u" } else { f };
         match (f, l) {
             ("c", "d") => {}
             ("c", _) => created.push(sid),
@@ -360,7 +400,7 @@ async fn mailbox_query(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError
         "position": 0, "ids": ids, "total": list.len()}))
 }
 
-fn set_error(kind: &str, desc: impl Into<String>) -> Value {
+pub(super) fn set_error(kind: &str, desc: impl Into<String>) -> Value {
     json!({"type": kind, "description": desc.into()})
 }
 
@@ -519,18 +559,22 @@ async fn mailbox_set(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> 
 
 // ---------------------------------------------------------------- emails
 
+pub(super) fn meta_of_row(row: &MessageRow) -> Meta {
+    meta_of(row)
+}
+
 fn meta_of(row: &MessageRow) -> Meta {
     serde_json::from_str(&row.meta).unwrap_or_default()
 }
 
-fn addrs_json(a: &[EmailAddr]) -> Value {
+pub(super) fn addrs_json(a: &[EmailAddr]) -> Value {
     if a.is_empty() {
         return Value::Null;
     }
     json!(a.iter().map(|x| json!({"name": x.name, "email": x.email})).collect::<Vec<_>>())
 }
 
-fn ids_json(v: &[String]) -> Value {
+pub(super) fn ids_json(v: &[String]) -> Value {
     if v.is_empty() {
         Value::Null
     } else {
@@ -556,7 +600,7 @@ fn part_name(data: &[u8], p: &Part) -> Option<String> {
         .map(|n| mime::decode_rfc2047(n.as_bytes()))
 }
 
-fn decoded(data: &[u8], p: &Part) -> Vec<u8> {
+pub(super) fn decoded(data: &[u8], p: &Part) -> Vec<u8> {
     let body = p.body_bytes(data);
     let enc = p.header(data, "content-transfer-encoding").map(|v| String::from_utf8_lossy(&v).trim().to_ascii_lowercase()).unwrap_or_default();
     match enc.as_str() {
@@ -581,14 +625,14 @@ struct BodyPart<'a> {
     part: &'a Part,
 }
 
-fn part_json(email: i64, data: &[u8], bp: &BodyPart, with_sub: bool) -> Value {
+fn part_json(blob_of: &dyn Fn(&[usize]) -> String, data: &[u8], bp: &BodyPart, with_sub: bool) -> Value {
     let p = bp.part;
     let ctype = format!("{}/{}", p.ctype, p.csub).to_ascii_lowercase();
     let disposition = p.header(data, "content-disposition").and_then(|v| mime::parse_disposition(&v)).map(|(d, _)| d.to_ascii_lowercase());
     let multipart = p.is_multipart();
     let mut o = json!({
         "partId": if multipart { Value::Null } else { json!(bp.path.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(".")) },
-        "blobId": if multipart { Value::Null } else { json!(part_blob_id(email, &bp.path)) },
+        "blobId": if multipart { Value::Null } else { json!(blob_of(&bp.path)) },
         "size": if multipart { 0 } else { decoded(data, p).len() },
         "name": part_name(data, p),
         "type": ctype,
@@ -606,7 +650,7 @@ fn part_json(email: i64, data: &[u8], bp: &BodyPart, with_sub: bool) -> Value {
             .map(|(i, c)| {
                 let mut path = bp.path.clone();
                 path.push(i + 1);
-                part_json(email, data, &BodyPart { path, part: c }, true)
+                part_json(blob_of, data, &BodyPart { path, part: c }, true)
             })
             .collect();
         o["subParts"] = json!(subs);
@@ -742,14 +786,7 @@ fn header_value(data: &[u8], root: &Part, spec: &str) -> Option<Value> {
 
 async fn email_get(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> {
     let props = props_arg(args, EMAIL_DEFAULT);
-    let body_props: Vec<String> = match args.get("bodyProperties").and_then(|v| v.as_array()) {
-        Some(b) => b.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
-        None => ["partId", "blobId", "size", "name", "type", "charset", "disposition", "cid", "language", "location"].iter().map(|s| s.to_string()).collect(),
-    };
-    let fetch_text = args.get("fetchTextBodyValues").and_then(|v| v.as_bool()).unwrap_or(false);
-    let fetch_html = args.get("fetchHTMLBodyValues").and_then(|v| v.as_bool()).unwrap_or(false);
-    let fetch_all = args.get("fetchAllBodyValues").and_then(|v| v.as_bool()).unwrap_or(false);
-    let max_bytes = args.get("maxBodyValueBytes").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let opts = BodyOpts::from_args(args);
     let ids = match ids_arg(ctx, args)? {
         Some(i) => i,
         None => {
@@ -794,175 +831,205 @@ async fn email_get(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> {
         o.insert("preview".into(), json!(m.preview));
         if needs_body {
             let raw = ctx.state.blobs.get(&row.blob).await?;
-            let data: &[u8] = &raw;
-            let root = mime::parse(data);
-            let top = BodyPart { path: if root.is_multipart() { vec![] } else { vec![1] }, part: &root };
-            let filter = |v: Value| -> Value {
-                match v {
-                    Value::Object(m) => Value::Object(
-                        m.into_iter()
-                            .filter(|(k, _)| k == "subParts" || body_props.iter().any(|p| p == k))
-                            .collect(),
-                    ),
-                    o => o,
-                }
-            };
-            let (mut html, mut text, mut atts) = (Some(vec![]), Some(vec![]), vec![]);
-            let start: Vec<BodyPart> = if root.is_multipart() {
-                root.children
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| BodyPart { path: vec![i + 1], part: c })
-                    .collect()
-            } else {
-                vec![BodyPart { path: vec![1], part: &root }]
-            };
-            let mtype = if root.is_multipart() { root.csub.to_ascii_lowercase() } else { "mixed".into() };
-            let alt = mtype == "alternative";
-            classify(start, &mtype, alt, data, &mut html, &mut text, &mut atts);
-            let text = text.unwrap_or_default();
-            let html = html.unwrap_or_default();
-            let parts_json = |v: &[BodyPart]| json!(v.iter().map(|b| filter(part_json(row.id, data, b, false))).collect::<Vec<_>>());
-            o.insert("textBody".into(), parts_json(&text));
-            o.insert("htmlBody".into(), parts_json(&html));
-            o.insert("attachments".into(), parts_json(&atts));
-            if props.iter().any(|p| p == "bodyStructure") {
-                fn strip(v: Value, keep: &[String]) -> Value {
-                    match v {
-                        Value::Object(m) => Value::Object(
-                            m.into_iter()
-                                .filter(|(k, _)| k == "subParts" || keep.iter().any(|p| p == k))
-                                .map(|(k, v)| if k == "subParts" { (k, Value::Array(v.as_array().cloned().unwrap_or_default().into_iter().map(|x| strip(x, keep)).collect())) } else { (k, v) })
-                                .collect(),
-                        ),
-                        o => o,
-                    }
-                }
-                o.insert("bodyStructure".into(), strip(part_json(row.id, data, &top, true), &body_props));
-            }
-            let mut values = Map::new();
-            let mut want: Vec<&BodyPart> = vec![];
-            if fetch_text || fetch_all {
-                want.extend(text.iter());
-            }
-            if fetch_html || fetch_all {
-                want.extend(html.iter());
-            }
-            if fetch_all {
-                want.extend(atts.iter().filter(|b| b.part.ctype.eq_ignore_ascii_case("text")));
-            }
-            for b in want {
-                let pid = b.path.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(".");
-                if values.contains_key(&pid) || !b.part.ctype.eq_ignore_ascii_case("text") {
-                    continue;
-                }
-                let mut t = text_of(data, b.part);
-                let mut truncated = false;
-                if max_bytes > 0 && t.len() > max_bytes {
-                    t.truncate(t.floor_char_boundary(max_bytes));
-                    truncated = true;
-                }
-                values.insert(pid, json!({"value": t, "isEncodingProblem": false, "isTruncated": truncated}));
-            }
-            o.insert("bodyValues".into(), Value::Object(values));
-            if props.iter().any(|p| p == "headers") {
-                let h: Vec<Value> = root
-                    .fields
-                    .iter()
-                    .filter(|f| !f.name.is_empty())
-                    .map(|f| json!({"name": f.name, "value": String::from_utf8_lossy(&data[f.value_start..f.end]).trim_end_matches("\r\n")}))
-                    .collect();
-                o.insert("headers".into(), json!(h));
-            }
-            for p in props.iter().filter(|p| p.starts_with("header:")) {
-                if let Some(v) = header_value(data, &root, p) {
-                    o.insert(p.clone(), v);
-                }
-            }
+            let email = row.id;
+            body_into(&mut o, &raw, &props, &opts, &|path: &[usize]| part_blob_id(email, path));
         }
         list.push(pick(o, &props));
     }
     Ok(json!({"accountId": account_id(&ctx.account), "state": state_str(ctx).await?, "list": list, "notFound": not_found}))
 }
 
+/// What Email/get and Email/parse return of bodies.
+pub(super) struct BodyOpts {
+    pub body_props: Vec<String>,
+    pub fetch_text: bool,
+    pub fetch_html: bool,
+    pub fetch_all: bool,
+    pub max_bytes: usize,
+}
+
+impl BodyOpts {
+    pub(super) fn from_args(args: &Value) -> Self {
+        BodyOpts {
+            body_props: match args.get("bodyProperties").and_then(|v| v.as_array()) {
+                Some(b) => b.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                None => ["partId", "blobId", "size", "name", "type", "charset", "disposition", "cid", "language", "location"].iter().map(|s| s.to_string()).collect(),
+            },
+            fetch_text: args.get("fetchTextBodyValues").and_then(|v| v.as_bool()).unwrap_or(false),
+            fetch_html: args.get("fetchHTMLBodyValues").and_then(|v| v.as_bool()).unwrap_or(false),
+            fetch_all: args.get("fetchAllBodyValues").and_then(|v| v.as_bool()).unwrap_or(false),
+            max_bytes: args.get("maxBodyValueBytes").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        }
+    }
+}
+
+/// Body properties (textBody, htmlBody, attachments, bodyStructure,
+/// bodyValues, headers, header:*) of a message, with part blob ids from `blob_of`.
+pub(super) fn body_into(o: &mut Map<String, Value>, data: &[u8], props: &[String], opts: &BodyOpts, blob_of: &dyn Fn(&[usize]) -> String) {
+    let root = mime::parse(data);
+    let top = BodyPart { path: if root.is_multipart() { vec![] } else { vec![1] }, part: &root };
+    let filter = |v: Value| -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.into_iter()
+                    .filter(|(k, _)| k == "subParts" || opts.body_props.iter().any(|p| p == k))
+                    .collect(),
+            ),
+            o => o,
+        }
+    };
+    let (mut html, mut text, mut atts) = (Some(vec![]), Some(vec![]), vec![]);
+    let start: Vec<BodyPart> = if root.is_multipart() {
+        root.children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| BodyPart { path: vec![i + 1], part: c })
+            .collect()
+    } else {
+        vec![BodyPart { path: vec![1], part: &root }]
+    };
+    let mtype = if root.is_multipart() { root.csub.to_ascii_lowercase() } else { "mixed".into() };
+    let alt = mtype == "alternative";
+    classify(start, &mtype, alt, data, &mut html, &mut text, &mut atts);
+    let text = text.unwrap_or_default();
+    let html = html.unwrap_or_default();
+    let parts_json = |v: &[BodyPart]| json!(v.iter().map(|b| filter(part_json(blob_of, data, b, false))).collect::<Vec<_>>());
+    o.insert("textBody".into(), parts_json(&text));
+    o.insert("htmlBody".into(), parts_json(&html));
+    o.insert("attachments".into(), parts_json(&atts));
+    if props.iter().any(|p| p == "bodyStructure") {
+        fn strip(v: Value, keep: &[String]) -> Value {
+            match v {
+                Value::Object(m) => Value::Object(
+                    m.into_iter()
+                        .filter(|(k, _)| k == "subParts" || keep.iter().any(|p| p == k))
+                        .map(|(k, v)| if k == "subParts" { (k, Value::Array(v.as_array().cloned().unwrap_or_default().into_iter().map(|x| strip(x, keep)).collect())) } else { (k, v) })
+                        .collect(),
+                ),
+                o => o,
+            }
+        }
+        o.insert("bodyStructure".into(), strip(part_json(blob_of, data, &top, true), &opts.body_props));
+    }
+    let mut values = Map::new();
+    let mut want: Vec<&BodyPart> = vec![];
+    if opts.fetch_text || opts.fetch_all {
+        want.extend(text.iter());
+    }
+    if opts.fetch_html || opts.fetch_all {
+        want.extend(html.iter());
+    }
+    if opts.fetch_all {
+        want.extend(atts.iter().filter(|b| b.part.ctype.eq_ignore_ascii_case("text")));
+    }
+    for b in want {
+        let pid = b.path.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(".");
+        if values.contains_key(&pid) || !b.part.ctype.eq_ignore_ascii_case("text") {
+            continue;
+        }
+        let mut t = text_of(data, b.part);
+        let mut truncated = false;
+        if opts.max_bytes > 0 && t.len() > opts.max_bytes {
+            t.truncate(t.floor_char_boundary(opts.max_bytes));
+            truncated = true;
+        }
+        values.insert(pid, json!({"value": t, "isEncodingProblem": false, "isTruncated": truncated}));
+    }
+    o.insert("bodyValues".into(), Value::Object(values));
+    if props.iter().any(|p| p == "headers") {
+        let h: Vec<Value> = root
+            .fields
+            .iter()
+            .filter(|f| !f.name.is_empty())
+            .map(|f| json!({"name": f.name, "value": String::from_utf8_lossy(&data[f.value_start..f.end]).trim_end_matches("\r\n")}))
+            .collect();
+        o.insert("headers".into(), json!(h));
+    }
+    for p in props.iter().filter(|p| p.starts_with("header:")) {
+        if let Some(v) = header_value(data, &root, p) {
+            o.insert(p.clone(), v);
+        }
+    }
+    }
+
 /// Evaluate an Email/query filter against a message.
 fn email_matches(ctx: &Ctx, f: &Value, row: &MessageRow, m: &Meta, thread_flags: &HashMap<i64, Vec<String>>) -> Result<bool, MethodError> {
     if let Some(op) = f.get("operator").and_then(|v| v.as_str()) {
-        let conds = f.get("conditions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let mut results = vec![];
-        for c in &conds {
-            results.push(email_matches(ctx, c, row, m, thread_flags)?);
-        }
-        return match op {
-            "AND" => Ok(results.iter().all(|x| *x)),
-            "OR" => Ok(results.iter().any(|x| *x)),
-            "NOT" => Ok(!results.iter().any(|x| *x)),
-            _ => Err(MethodError("unsupportedFilter", format!("Unknown operator {op}"))),
-        };
+    let conds = f.get("conditions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut results = vec![];
+    for c in &conds {
+        results.push(email_matches(ctx, c, row, m, thread_flags)?);
+    }
+    return match op {
+        "AND" => Ok(results.iter().all(|x| *x)),
+        "OR" => Ok(results.iter().any(|x| *x)),
+        "NOT" => Ok(!results.iter().any(|x| *x)),
+        _ => Err(MethodError("unsupportedFilter", format!("Unknown operator {op}"))),
+    };
     }
     let Some(obj) = f.as_object() else { return Ok(true) };
     let text_in = |hay: &str, needle: &str| hay.to_lowercase().contains(&needle.to_lowercase());
     let addr_text = |a: &[EmailAddr]| a.iter().map(|x| format!("{} {}", x.name.clone().unwrap_or_default(), x.email)).collect::<Vec<_>>().join(" ");
     for (k, v) in obj {
-        let ok = match k.as_str() {
-            "inMailbox" => v.as_str().map(|s| num_id(&ctx.id(s), 'm') == Some(row.mailbox_id)).unwrap_or(false),
-            "inMailboxOtherThan" => !v.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| num_id(&ctx.id(s), 'm') == Some(row.mailbox_id))).unwrap_or(false),
-            "before" => v.as_str().and_then(parse_utc).map(|t| row.internal_date < t).unwrap_or(false),
-            "after" => v.as_str().and_then(parse_utc).map(|t| row.internal_date >= t).unwrap_or(false),
-            "minSize" => v.as_i64().map(|n| row.size >= n).unwrap_or(false),
-            "maxSize" => v.as_i64().map(|n| row.size < n).unwrap_or(false),
-            "hasKeyword" => v.as_str().map(|k| has_keyword(&row.flags, k)).unwrap_or(false),
-            "notKeyword" => v.as_str().map(|k| !has_keyword(&row.flags, k)).unwrap_or(false),
-            "allInThreadHaveKeyword" | "someInThreadHaveKeyword" | "noneInThreadHaveKeyword" => {
-                let kw = v.as_str().unwrap_or("");
-                let flags = thread_flags.get(&row.thread_id).cloned().unwrap_or_default();
-                let n = flags.iter().filter(|f| has_keyword(f, kw)).count();
-                match k.as_str() {
-                    "allInThreadHaveKeyword" => n == flags.len() && n > 0,
-                    "someInThreadHaveKeyword" => n > 0,
-                    _ => n == 0,
-                }
+    let ok = match k.as_str() {
+        "inMailbox" => v.as_str().map(|s| num_id(&ctx.id(s), 'm') == Some(row.mailbox_id)).unwrap_or(false),
+        "inMailboxOtherThan" => !v.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).any(|s| num_id(&ctx.id(s), 'm') == Some(row.mailbox_id))).unwrap_or(false),
+        "before" => v.as_str().and_then(parse_utc).map(|t| row.internal_date < t).unwrap_or(false),
+        "after" => v.as_str().and_then(parse_utc).map(|t| row.internal_date >= t).unwrap_or(false),
+        "minSize" => v.as_i64().map(|n| row.size >= n).unwrap_or(false),
+        "maxSize" => v.as_i64().map(|n| row.size < n).unwrap_or(false),
+        "hasKeyword" => v.as_str().map(|k| has_keyword(&row.flags, k)).unwrap_or(false),
+        "notKeyword" => v.as_str().map(|k| !has_keyword(&row.flags, k)).unwrap_or(false),
+        "allInThreadHaveKeyword" | "someInThreadHaveKeyword" | "noneInThreadHaveKeyword" => {
+            let kw = v.as_str().unwrap_or("");
+            let flags = thread_flags.get(&row.thread_id).cloned().unwrap_or_default();
+            let n = flags.iter().filter(|f| has_keyword(f, kw)).count();
+            match k.as_str() {
+                "allInThreadHaveKeyword" => n == flags.len() && n > 0,
+                "someInThreadHaveKeyword" => n > 0,
+                _ => n == 0,
             }
-            "hasAttachment" => v.as_bool().map(|b| m.has_attachment == b).unwrap_or(false),
-            "from" => v.as_str().map(|s| text_in(&addr_text(&m.from), s)).unwrap_or(false),
-            "to" => v.as_str().map(|s| text_in(&addr_text(&m.to), s)).unwrap_or(false),
-            "cc" => v.as_str().map(|s| text_in(&addr_text(&m.cc), s)).unwrap_or(false),
-            "bcc" => v.as_str().map(|s| text_in(&addr_text(&m.bcc), s)).unwrap_or(false),
-            "subject" => v.as_str().map(|s| text_in(&m.subject, s)).unwrap_or(false),
-            "body" => v.as_str().map(|s| text_in(&m.preview, s)).unwrap_or(false),
-            "text" => v
-                .as_str()
-                .map(|s| {
-                    text_in(&m.subject, s)
-                        || text_in(&m.preview, s)
-                        || text_in(&addr_text(&m.from), s)
-                        || text_in(&addr_text(&m.to), s)
-                        || text_in(&addr_text(&m.cc), s)
-                })
-                .unwrap_or(false),
-            "header" => {
-                let arr = v.as_array().cloned().unwrap_or_default();
-                let name = arr.first().and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
-                let val = arr.get(1).and_then(|x| x.as_str());
-                let hv = match name.as_str() {
-                    "subject" => Some(m.subject.clone()),
-                    "from" => Some(addr_text(&m.from)),
-                    "to" => Some(addr_text(&m.to)),
-                    "cc" => Some(addr_text(&m.cc)),
-                    "message-id" => m.msgid.clone(),
-                    _ => None,
-                };
-                match (hv, val) {
-                    (Some(h), Some(v)) => text_in(&h, v),
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                }
-            }
-            _ => return Err(MethodError("unsupportedFilter", format!("Unsupported filter {k}"))),
-        };
-        if !ok {
-            return Ok(false);
         }
+        "hasAttachment" => v.as_bool().map(|b| m.has_attachment == b).unwrap_or(false),
+        "from" => v.as_str().map(|s| text_in(&addr_text(&m.from), s)).unwrap_or(false),
+        "to" => v.as_str().map(|s| text_in(&addr_text(&m.to), s)).unwrap_or(false),
+        "cc" => v.as_str().map(|s| text_in(&addr_text(&m.cc), s)).unwrap_or(false),
+        "bcc" => v.as_str().map(|s| text_in(&addr_text(&m.bcc), s)).unwrap_or(false),
+        "subject" => v.as_str().map(|s| text_in(&m.subject, s)).unwrap_or(false),
+        "body" => v.as_str().map(|s| text_in(&m.preview, s)).unwrap_or(false),
+        "text" => v
+            .as_str()
+            .map(|s| {
+                text_in(&m.subject, s)
+                    || text_in(&m.preview, s)
+                    || text_in(&addr_text(&m.from), s)
+                    || text_in(&addr_text(&m.to), s)
+                    || text_in(&addr_text(&m.cc), s)
+            })
+            .unwrap_or(false),
+        "header" => {
+            let arr = v.as_array().cloned().unwrap_or_default();
+            let name = arr.first().and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
+            let val = arr.get(1).and_then(|x| x.as_str());
+            let hv = match name.as_str() {
+                "subject" => Some(m.subject.clone()),
+                "from" => Some(addr_text(&m.from)),
+                "to" => Some(addr_text(&m.to)),
+                "cc" => Some(addr_text(&m.cc)),
+                "message-id" => m.msgid.clone(),
+                _ => None,
+            };
+            match (hv, val) {
+                (Some(h), Some(v)) => text_in(&h, v),
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
+        }
+        _ => return Err(MethodError("unsupportedFilter", format!("Unsupported filter {k}"))),
+    };
+    if !ok {
+        return Ok(false);
+    }
     }
     Ok(true)
 }
@@ -1028,13 +1095,68 @@ async fn email_query(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> 
     }
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(1000).clamp(0, 10_000);
     let ids: Vec<String> = hits.iter().skip(position as usize).take(limit as usize).map(|r| format!("e{}", r.id)).collect();
-    let mut out = json!({"accountId": account_id(&ctx.account), "queryState": state_str(ctx).await?, "canCalculateChanges": false,
+    let mut out = json!({"accountId": account_id(&ctx.account), "queryState": state_str(ctx).await?,
+        "canCalculateChanges": !args.get("collapseThreads").and_then(|v| v.as_bool()).unwrap_or(false),
         "position": position, "ids": ids});
     if args.get("calculateTotal").and_then(|v| v.as_bool()).unwrap_or(false) {
         out["total"] = json!(total);
     }
     if args.get("limit").is_some() {
         out["limit"] = json!(limit);
+    }
+    Ok(out)
+}
+
+/// Email/queryChanges (RFC 8620 5.6). Every message changed since the old
+/// state is reported removed, and re-added at its current index if it still
+/// matches; the spec allows this, and it needs no stored results.
+async fn email_query_changes(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> {
+    if args.get("collapseThreads").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(MethodError("cannotCalculateChanges", "Collapsed queries can't be followed; run the query again.".into()));
+    }
+    let since_s = args.get("sinceQueryState").and_then(|v| v.as_str()).ok_or_else(|| MethodError::invalid("sinceQueryState is required"))?;
+    let since: i64 = since_s.parse().map_err(|_| MethodError("cannotCalculateChanges", "Unknown state.".into()))?;
+    let max = args.get("maxChanges").and_then(|v| v.as_i64()).unwrap_or(5000).clamp(1, 50_000);
+    let Some((rows, _, more)) = ctx.state.db.changes_since(ctx.account.id, "Email", since, 50_000).await? else {
+        return Err(MethodError("cannotCalculateChanges", "State too old; run the query again.".into()));
+    };
+    if more {
+        return Err(MethodError("cannotCalculateChanges", "Too many changes; run the query again.".into()));
+    }
+    let mut changed: Vec<String> = vec![];
+    for (id, _) in rows {
+        let sid = format!("e{id}");
+        if !changed.contains(&sid) {
+            changed.push(sid);
+        }
+    }
+    // The query as it is now, in full.
+    let mut q = args.clone();
+    if let Some(o) = q.as_object_mut() {
+        for k in ["position", "anchor", "anchorOffset", "sinceQueryState", "maxChanges", "upToId"] {
+            o.remove(k);
+        }
+        o.insert("limit".into(), json!(10_000));
+        o.insert("calculateTotal".into(), json!(true));
+    }
+    let now = email_query(ctx, &q).await?;
+    let ids: Vec<String> = now["ids"].as_array().cloned().unwrap_or_default().iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    // upToId: changes after that id in the results needn't be reported.
+    let up_to = args.get("upToId").and_then(|v| v.as_str()).map(|s| ctx.id(s));
+    let cutoff = up_to.as_ref().and_then(|u| ids.iter().position(|i| i == u)).unwrap_or(usize::MAX);
+    let mut added = vec![];
+    for (index, id) in ids.iter().enumerate() {
+        if index <= cutoff && changed.contains(id) {
+            added.push(json!({"id": id, "index": index}));
+        }
+    }
+    if (changed.len() + added.len()) as i64 > max {
+        return Err(MethodError("tooManyChanges", "More changes than maxChanges.".into()));
+    }
+    let mut out = json!({"accountId": account_id(&ctx.account), "oldQueryState": since_s, "newQueryState": now["queryState"],
+        "removed": changed, "added": added});
+    if args.get("calculateTotal").and_then(|v| v.as_bool()).unwrap_or(false) {
+        out["total"] = now["total"].clone();
     }
     Ok(out)
 }
@@ -1092,6 +1214,21 @@ pub async fn blob_bytes(state: &State, a: &Account, blob: &str) -> anyhow::Resul
             return Ok(None);
         }
         return Ok(Some(state.blobs.get(&key).await?.to_vec()));
+    }
+    // A calendar or contact resource: D<node>.
+    if let Some(id) = num_id(blob, 'D') {
+        let Some(p) = crate::dav::store::principal(state, a).await? else { return Ok(None) };
+        let Some(n) = state.db.dav_node_by_id(p.id, id).await? else { return Ok(None) };
+        return Ok(Some(crate::dav::read_blob(state, &n).await?));
+    }
+    // A part of another blob (Email/parse): P<blob>~<1-2-3>.
+    if let Some(rest) = blob.strip_prefix('P') {
+        let Some((src, path)) = rest.rsplit_once('~') else { return Ok(None) };
+        let path: Vec<usize> = path.split('-').filter_map(|x| x.parse().ok()).collect();
+        let Some(raw) = Box::pin(blob_bytes(state, a, src)).await? else { return Ok(None) };
+        let root = mime::parse(&raw);
+        let Some(p) = mime::find_part(&root, &path) else { return Ok(None) };
+        return Ok(Some(if p.message.is_some() { p.body_bytes(&raw).to_vec() } else { decoded(&raw, p) }));
     }
     if let Some(rest) = blob.strip_prefix('p') {
         let Some((eid, path)) = rest.split_once('_') else { return Ok(None) };
@@ -1243,7 +1380,7 @@ async fn destroy_email(ctx: &Ctx, row: &MessageRow) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn encode_header_text(s: &str) -> String {
+pub(super) fn encode_header_text(s: &str) -> String {
     if s.is_ascii() && !s.contains(['\r', '\n']) {
         return s.to_string();
     }
@@ -1378,7 +1515,7 @@ async fn build_email(ctx: &Ctx, obj: &Map<String, Value>) -> Result<Vec<u8>, Str
     Ok(format!("{h}{body}").into_bytes())
 }
 
-async fn email_set(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> {
+pub(super) async fn email_set(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> {
     let old_state = state_str(ctx).await?;
     if let Some(s) = args.get("ifInState").and_then(|v| v.as_str()) {
         if s != old_state {
@@ -1525,34 +1662,8 @@ async fn email_import(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError>
 
 // ---------------------------------------------------------------- submission
 
-async fn identities(ctx: &Ctx) -> anyhow::Result<Vec<(String, String)>> {
-    let mut out = vec![(format!("i{}", ctx.account.id), ctx.account.email.clone())];
-    for a in ctx.state.db.list_aliases().await? {
-        if a.active && !a.source.starts_with('@') && a.destination.split([',', ' ']).any(|d| d.trim().eq_ignore_ascii_case(&ctx.account.email)) {
-            out.push((format!("i{}x{}", ctx.account.id, a.id), a.source.clone()));
-        }
-    }
-    Ok(out)
-}
-
-async fn identity_get(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> {
-    let all = identities(ctx).await?;
-    let ids = ids_arg(ctx, args)?;
-    let mut list = vec![];
-    let mut not_found = vec![];
-    let wanted: Vec<String> = ids.clone().unwrap_or_else(|| all.iter().map(|x| x.0.clone()).collect());
-    for id in wanted {
-        match all.iter().find(|x| x.0 == id) {
-            Some((id, email)) => list.push(json!({"id": id, "name": ctx.account.display_name, "email": email, "replyTo": null,
-                "bcc": null, "textSignature": "", "htmlSignature": "", "mayDelete": false})),
-            None => not_found.push(id),
-        }
-    }
-    Ok(json!({"accountId": account_id(&ctx.account), "state": state_str(ctx).await?, "list": list, "notFound": not_found}))
-}
-
 /// Remove Bcc header fields before sending.
-fn strip_bcc(raw: &[u8]) -> Vec<u8> {
+pub(super) fn strip_bcc(raw: &[u8]) -> Vec<u8> {
     let root = mime::parse(raw);
     let mut out = Vec::with_capacity(raw.len());
     let mut pos = 0;
@@ -1562,106 +1673,6 @@ fn strip_bcc(raw: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(&raw[pos..]);
     out
-}
-
-async fn submission_set(ctx: &mut Ctx, args: &Value) -> R {
-    let old_state = state_str(ctx).await?;
-    let (mut created, mut not_created) = (Map::new(), Map::new());
-    let mut email_updates: Map<String, Value> = Map::new();
-    let mut email_destroys: Vec<Value> = vec![];
-    let ids = identities(ctx).await?;
-    if let Some(c) = args.get("create").and_then(|v| v.as_object()) {
-        for (cid, obj) in c {
-            let identity = obj.get("identityId").and_then(|v| v.as_str()).map(|s| ctx.id(s)).unwrap_or_default();
-            let Some((_, from)) = ids.iter().find(|x| x.0 == identity).cloned() else {
-                not_created.insert(cid.clone(), set_error("invalidProperties", "identityId not found"));
-                continue;
-            };
-            let email_id = obj.get("emailId").and_then(|v| v.as_str()).map(|s| ctx.id(s)).unwrap_or_default();
-            let rows = match num_id(&email_id, 'e') {
-                Some(n) => ctx.state.db.messages_by_ids(ctx.account.id, &[n]).await?,
-                None => vec![],
-            };
-            let Some(row) = rows.into_iter().next() else {
-                not_created.insert(cid.clone(), set_error("invalidProperties", "emailId not found"));
-                continue;
-            };
-            let meta = meta_of(&row);
-            let env = obj.get("envelope");
-            let mail_from = env.and_then(|e| e.get("mailFrom")).and_then(|m| m.get("email")).and_then(|v| v.as_str()).map(String::from).unwrap_or(from.clone());
-            if !mail_from.eq_ignore_ascii_case(&from) && !ctx.account.is_admin() {
-                not_created.insert(cid.clone(), set_error("forbiddenMailFrom", "You may only send from your own addresses"));
-                continue;
-            }
-            let rcpts: Vec<String> = match env.and_then(|e| e.get("rcptTo")).and_then(|v| v.as_array()) {
-                Some(a) => a.iter().filter_map(|x| x.get("email").and_then(|e| e.as_str()).map(String::from)).collect(),
-                None => meta.to.iter().chain(meta.cc.iter()).chain(meta.bcc.iter()).map(|a| a.email.clone()).collect(),
-            };
-            let rcpts: Vec<String> = rcpts.iter().filter_map(|r| crate::util::normalize_address(r)).collect();
-            if rcpts.is_empty() {
-                not_created.insert(cid.clone(), set_error("noRecipients", "No recipients"));
-                continue;
-            }
-            let limits = ctx.state.settings().limits.clone();
-            if rcpts.len() > limits.max_recipients {
-                not_created.insert(cid.clone(), set_error("tooManyRecipients", "Too many recipients"));
-                continue;
-            }
-            if limits.send_rate_per_hour > 0 && ctx.state.db.record_send(ctx.account.id).await? > limits.send_rate_per_hour as i64 {
-                not_created.insert(cid.clone(), set_error("rateLimit", "Hourly sending limit reached"));
-                continue;
-            }
-            let raw = ctx.state.blobs.get(&row.blob).await?;
-            let body = strip_bcc(&raw);
-            let signed = crate::smtp::delivery::dkim_sign(&ctx.state, crate::util::domain_of(&mail_from), body).await;
-            let mut failed = None;
-            for r in &rcpts {
-                match crate::smtp::delivery::resolve(&ctx.state, r, ctx.account.can_send_external).await {
-                    Ok(targets) => {
-                        for t in targets {
-                            let res = crate::smtp::deliver_target(&ctx.state, &mail_from, &signed, t, false).await;
-                            if let Err(e) = res {
-                                failed = Some(e.to_string());
-                            }
-                        }
-                    }
-                    Err(e) => failed = Some(format!("{r}: {e:?}")),
-                }
-            }
-            if let Some(e) = failed {
-                not_created.insert(cid.clone(), set_error("invalidRecipients", e));
-                continue;
-            }
-            ctx.state.event("info", "smtp", &format!("JMAP submission from {} to {} recipient(s)", ctx.account.email, rcpts.len()));
-            let sid = format!("s{}", crate::util::now());
-            ctx.created.insert(cid.clone(), sid.clone());
-            created.insert(cid.clone(), json!({"id": sid, "undoStatus": "final", "sendAt": utc(crate::util::now())}));
-            // onSuccess* refer to the submission's creation id or id.
-            let key_matches = |k: &str| k == format!("#{cid}") || k == sid;
-            if let Some(u) = args.get("onSuccessUpdateEmail").and_then(|v| v.as_object()) {
-                for (k, patch) in u {
-                    if key_matches(k) {
-                        email_updates.insert(email_id.clone(), patch.clone());
-                    }
-                }
-            }
-            if let Some(d) = args.get("onSuccessDestroyEmail").and_then(|v| v.as_array()) {
-                if d.iter().filter_map(|v| v.as_str()).any(key_matches) {
-                    email_destroys.push(json!(email_id));
-                }
-            }
-        }
-    }
-    let mut out = vec![(
-        "EmailSubmission/set".to_string(),
-        json!({"accountId": account_id(&ctx.account), "oldState": old_state, "newState": state_str(ctx).await?,
-            "created": created, "notCreated": not_created, "updated": {}, "destroyed": [], "notUpdated": {}, "notDestroyed": {}}),
-    )];
-    if !email_updates.is_empty() || !email_destroys.is_empty() {
-        let set_args = json!({"accountId": account_id(&ctx.account), "update": email_updates, "destroy": email_destroys});
-        out.push(("Email/set".to_string(), email_set(ctx, &set_args).await?));
-    }
-    Ok(out)
 }
 
 async fn quota_get(ctx: &mut Ctx, args: &Value) -> Result<Value, MethodError> {

@@ -152,6 +152,8 @@ async fn serve(cfg: Config, path: PathBuf) -> anyhow::Result<()> {
         (l.imap, server::Proto::Imap),
         (l.imaps, server::Proto::Imaps),
         (l.managesieve, server::Proto::ManageSieve),
+        (l.pop3, server::Proto::Pop3),
+        (l.pop3s, server::Proto::Pop3s),
     ];
     for (addrs, proto) in groups {
         for a in addrs {
@@ -174,6 +176,7 @@ async fn serve(cfg: Config, path: PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("no listeners could be started");
     }
     picacho_server::queue::spawn_worker(state.clone());
+    picacho_server::submit::spawn_worker(state.clone());
     picacho_server::relay::spawn_puller(state.clone());
     picacho_server::ops::spawn_maintenance(state.clone());
     picacho_server::acme::spawn(state.clone());

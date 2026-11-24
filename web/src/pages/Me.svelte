@@ -1,7 +1,7 @@
 <script>
   // Console for regular (non-admin) users: their settings, filters, app passwords and data.
   import { onMount } from 'svelte';
-  import { get, post, put } from '../lib/api.js';
+  import { get, post, put, del } from '../lib/api.js';
   import { ui } from '../lib/ui.svelte.js';
   import { theme } from '../lib/theme.svelte.js';
   import { toast } from '../lib/toast.svelte.js';
@@ -60,6 +60,36 @@
     location.href = '/';
   }
 
+  // ---- encryption at rest
+  let enc = $state(null);
+  let encKey = $state('');
+  let encBusy = $state(false);
+  $effect(() => {
+    if (tab === 'account' && !enc) get('/me/encryption').then((v) => (enc = v)).catch(() => {});
+  });
+  async function setKey(e) {
+    e.preventDefault();
+    encBusy = true;
+    try {
+      enc = await put('/me/encryption', { public_key: encKey });
+      encKey = '';
+      toast.ok('New mail is stored encrypted to this key.');
+    } catch (err) {
+      toast.error(err);
+    } finally {
+      encBusy = false;
+    }
+  }
+  async function removeKey() {
+    if (!confirm('Store new mail unencrypted? Mail already encrypted stays encrypted.')) return;
+    try {
+      enc = await del('/me/encryption');
+      toast.ok('New mail is stored as it arrives.');
+    } catch (err) {
+      toast.error(err);
+    }
+  }
+
   // ---- calendars & contacts
   let dav = $state(null);
   let davLoaded = $state(false);
@@ -108,6 +138,22 @@
       <div class="card"><h3>Mail app settings</h3><p class="sub">Use these in Apple Mail, Thunderbird, Outlook, Picacho or any IMAP client.</p><ClientSettings {client} /></div>
       {#if ui.me.sso_linked}
         <div class="notice" style="margin-top:14px"><Icon name="lock" size={18} /><span>You sign in with single sign-on.{ui.me.has_password ? '' : ' Your mailbox has no password, so mail apps use app passwords or sign in with your account.'}</span></div>
+      {/if}
+      {#if enc}
+        <form class="card" onsubmit={setKey}>
+          <h3>Encryption at rest</h3>
+          {#if enc.encrypted}
+            <p class="sub">Mail delivered to you is stored encrypted to your OpenPGP key. Only apps holding the private key, such as Picacho, can read it; this server can't. Fingerprint:</p>
+            <div class="row"><code class="fp">{enc.fingerprint.match(/.{1,4}/g).join(' ')}</code><Copy value={enc.fingerprint} /></div>
+          {:else}
+            <p class="sub">Paste an OpenPGP public key and mail delivered to you is stored encrypted to it. Keep the private key safe: without it, encrypted mail can't be read.</p>
+          {/if}
+          <label class="field" style="margin-top:12px"><span>{enc.encrypted ? 'Replace with another key' : 'Public key'}</span><textarea class="input mono" rows="4" bind:value={encKey} placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"></textarea></label>
+          <div class="row" style="margin-top:12px">
+            <button class="btn primary" disabled={encBusy || !encKey.trim()}>{enc.encrypted ? 'Replace key' : 'Encrypt my mail'}</button>
+            {#if enc.encrypted}<button type="button" class="btn" onclick={removeKey}>Stop encrypting</button>{/if}
+          </div>
+        </form>
       {/if}
       {#if ui.me.has_password}
         <form class="card" onsubmit={change}>
@@ -204,5 +250,6 @@
   .urls { display: grid; grid-template-columns: 80px minmax(0, 1fr) auto; gap: 6px 12px; align-items: center; }
   .card.row :global(svg) { color: var(--muted); }
   form.card { margin-top: 14px; }
+  .fp { font-size: 13px; word-break: break-all; }
   .tabs + .card { margin-top: 0; }
 </style>

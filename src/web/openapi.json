@@ -117,6 +117,10 @@
      "oidc_subject": {
       "type": "string",
       "description": "The identity provider's `sub` for this person. Links the mailbox, so single sign-on and the provider's access tokens resolve to it. 409 if the identity already has a mailbox."
+     },
+     "encryption_key": {
+      "type": "string",
+      "description": "An OpenPGP public key (armored). Mail delivered to the account is stored encrypted to it (PGP/MIME), so only the key's owner can read it. 400 if it isn't a usable encryption key."
      }
     }
    },
@@ -147,6 +151,10 @@
      "oidc_subject": {
       "type": "string",
       "description": "Link the mailbox to this identity provider subject; an empty string unlinks it."
+     },
+     "encryption_key": {
+      "type": "string",
+      "description": "Replace the encryption-at-rest key, or \"\" to stop encrypting new mail (mail already encrypted stays encrypted)."
      }
     }
    },
@@ -264,6 +272,27 @@
      },
      "next_attempt": {
       "type": "integer"
+     }
+    }
+   },
+   "EncryptionKey": {
+    "type": "object",
+    "properties": {
+     "encrypted": {
+      "type": "boolean"
+     },
+     "fingerprint": {
+      "type": [
+       "string",
+       "null"
+      ],
+      "description": "Uppercase hex OpenPGP fingerprint."
+     },
+     "updated_at": {
+      "type": [
+       "integer",
+       "null"
+      ]
      }
     }
    }
@@ -1354,6 +1383,114 @@
       "$ref": "#/components/responses/Error"
      }
     }
+   }
+  },
+  "/accounts/{id}/encryption": {
+   "get": {
+    "summary": "Encryption at rest: whether mail is stored encrypted, and to which key",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "The account's encryption at rest",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/EncryptionKey"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ]
+   },
+   "put": {
+    "summary": "Encrypt mail delivered to the account to this OpenPGP public key",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "The account's encryption at rest",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/EncryptionKey"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "public_key"
+        ],
+        "properties": {
+         "public_key": {
+          "type": "string",
+          "description": "Armored OpenPGP public key"
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "summary": "Stop encrypting new mail",
+    "tags": [
+     "Accounts"
+    ],
+    "responses": {
+     "200": {
+      "description": "The account's encryption at rest",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/EncryptionKey"
+        }
+       }
+      }
+     }
+    },
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ]
    }
   }
  }

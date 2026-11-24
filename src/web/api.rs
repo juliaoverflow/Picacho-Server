@@ -74,6 +74,7 @@ pub fn routes(state: State) -> Router {
         .route("/api/setup/storage", post(setup_storage))
         .route("/api/setup/storage/test", post(setup_storage_test))
         .route("/api/oidc/test", post(oidc_test))
+        .route("/api/admin/ldap/test", post(ldap_test))
         .route("/api/auth/oidc/start", get(oidc_start))
         .route("/api/auth/oidc/callback", get(oidc_callback))
         .route("/api/setup/verify", post(setup_verify))
@@ -234,7 +235,9 @@ async fn status(AxState(state): AxState<State>, headers: HeaderMap) -> R {
         "hostname": state.hostname(),
         "version": env!("CARGO_PKG_VERSION"),
         "auth": {
-            "password": crate::auth::web_password_allowed(&state),
+            "password": crate::auth::web_password_allowed(&state) || s.auth.ldap_web(),
+            // Directory passwords: the form also accepts a user name.
+            "ldap": if s.auth.ldap_web() { json!({"name": s.auth.ldap.display_name}) } else { Value::Null },
             "oidc": if s.auth.oidc.enabled { json!({"name": s.auth.oidc.display_name}) } else { Value::Null },
             // Apps get mailbox access from this identity provider.
             "provider": if s.auth.oidc.access_tokens { json!({"name": s.auth.oidc.display_name, "issuer": s.auth.oidc.issuer.trim_end_matches('/')}) } else { Value::Null },
@@ -447,6 +450,26 @@ async fn oidc_test(AxState(state): AxState<State>, headers: HeaderMap, Json(b): 
 }
 
 #[derive(Deserialize)]
+struct LdapTest {
+    ldap: crate::settings::LdapSettings,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// Try directory settings (before saving them): connect, bind the service
+/// account, and optionally look up a user and check their password.
+async fn ldap_test(AxState(state): AxState<State>, headers: HeaderMap, Json(mut b): Json<LdapTest>) -> R {
+    admin(&state, &headers).await?;
+    if b.ldap.bind_password.as_deref() == Some(crate::settings::REDACTED) {
+        b.ldap.bind_password = state.settings().auth.ldap.bind_password.clone();
+    }
+    let r = crate::ldap::test(&b.ldap, b.user.as_deref(), b.password.as_deref()).await.map_err(bad)?;
+    Ok(Json(r))
+}
+
+#[derive(Deserialize)]
 struct StorageBody {
     key: String,
     storage: crate::config::Storage,
@@ -586,14 +609,21 @@ async fn login(
     Json(b): Json<LoginBody>,
 ) -> Result<Response, ApiError> {
     let ip = client_ip(&state, peer, &headers);
-    if !crate::auth::web_password_allowed(&state) {
+    let (local, ldap) = (crate::auth::web_password_allowed(&state), state.settings().auth.ldap_web());
+    if !local && !ldap {
         return Err(ApiError(StatusCode::FORBIDDEN, "Password sign-in is turned off. Use single sign-on.".into()));
     }
-    match crate::auth::login(&state, &b.email, &b.password, ip).await {
+    match crate::auth::password_login(&state, &b.email, &b.password, ip, local, ldap).await {
         Ok(a) => {
             let _ = state.db.touch_login(a.id).await;
             state.event("info", "auth", &format!("console login {} from {ip}", a.email));
             start_session(&state, &headers, &a, ip).await
+        }
+        Err(crate::auth::AuthError::NotPermitted) => {
+            Err(ApiError(StatusCode::FORBIDDEN, "Your directory account isn't allowed to use this server.".into()))
+        }
+        Err(crate::auth::AuthError::Internal) => {
+            Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "Sign-in is temporarily unavailable. Try again shortly.".into()))
         }
         Err(crate::auth::AuthError::Banned) => {
             Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "Too many failed sign-ins. Try again later.".into()))
@@ -996,6 +1026,10 @@ struct NewAccount {
     role: Option<String>,
     #[serde(default)]
     quota_mb: Option<i64>,
+    /// OpenPGP public key (armored): mail delivered to the account is
+    /// stored encrypted to it (encryption at rest).
+    #[serde(default)]
+    encryption_key: Option<String>,
 }
 
 async fn create_account(AxState(state): AxState<State>, headers: HeaderMap, Json(b): Json<NewAccount>) -> R {
@@ -1029,6 +1063,10 @@ async fn create_account(AxState(state): AxState<State>, headers: HeaderMap, Json
         return Err(bad("Role must be user or admin."));
     }
     let quota = b.quota_mb.unwrap_or(state.settings().limits.default_quota_mb as i64).max(0) * 1024 * 1024;
+    let key = match b.encryption_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => Some((k.to_string(), parse_encryption_key(k).await?)),
+        None => None,
+    };
     let hash = if b.password.is_empty() {
         "!".to_string()
     } else {
@@ -1038,6 +1076,9 @@ async fn create_account(AxState(state): AxState<State>, headers: HeaderMap, Json
     let id = state.db.create_account(&email, dom.id, &hash, b.display_name.trim(), &role, quota).await?;
     if let Some(k) = &link {
         state.db.set_oidc_sub(id, k).await?;
+    }
+    if let Some((armored, fp)) = &key {
+        state.db.set_encryption_key(id, Some((armored, fp))).await?;
     }
     state.event("info", "admin", &format!("{} created account {email}", who.email));
     let a = state.db.get_account(id).await?.ok_or_else(not_found)?;
@@ -1081,6 +1122,8 @@ struct AccountPatch {
     keep_copy: Option<bool>,
     /// Link (or with "" unlink) the identity provider's `sub`.
     oidc_subject: Option<String>,
+    /// Set the encryption-at-rest key (or with "" stop encrypting).
+    encryption_key: Option<String>,
 }
 
 async fn update_account(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>, Json(b): Json<AccountPatch>) -> R {
@@ -1135,6 +1178,9 @@ async fn update_account(AxState(state): AxState<State>, headers: HeaderMap, Path
         }
         state.db.set_oidc_sub(a.id, &link).await?;
         a.oidc_sub = link;
+    }
+    if let Some(k) = b.encryption_key {
+        set_key(&state, &a, Some(k.as_str()).filter(|k| !k.trim().is_empty())).await?;
     }
     state.db.update_account(&a).await?;
     state.event("info", "admin", &format!("{} updated account {}", who.email, a.email));
@@ -1615,6 +1661,7 @@ async fn audit_mw(
 
 fn ext_admin_routes() -> Router<State> {
     Router::new()
+        .route("/accounts/{id}/encryption", get(admin_get_key).put(admin_put_key).delete(admin_delete_key))
         .route("/server", get(server_info))
         .route("/audit", get(audit_log))
         .route("/reports", get(list_reports))
@@ -2177,6 +2224,7 @@ fn me_routes() -> Router<State> {
         .route("/app-passwords", get(me_list_tokens).post(me_create_token))
         .route("/app-passwords/{id}", delete(me_delete_token))
         .route("/dav", get(me_dav).put(me_dav_password))
+        .route("/encryption", get(me_get_key).put(me_put_key).delete(me_delete_key))
         .route("/export", get(me_export))
         .route("/migrate", post(me_migrate))
         .route("/servers", get(me_servers))
@@ -2213,6 +2261,79 @@ async fn me_patch(AxState(state): AxState<State>, headers: HeaderMap, Json(b): J
     }
     state.db.update_account(&a).await?;
     Ok(Json(account_json(&a)))
+}
+
+// ------------------------------------------------------------ encryption at rest
+
+/// Check an armored OpenPGP public key; returns its fingerprint.
+async fn parse_encryption_key(armored: &str) -> Result<String, ApiError> {
+    let k = armored.to_string();
+    let r = tokio::task::spawn_blocking(move || crate::encryption::parse_key(&k).map(|(_, fp)| fp)).await.map_err(|e| anyhow::anyhow!(e))?;
+    r.map_err(bad)
+}
+
+async fn key_json(state: &State, account_id: i64) -> Result<Value, ApiError> {
+    Ok(match state.db.encryption_key_info(account_id).await? {
+        Some((fp, at)) => json!({"encrypted": true, "fingerprint": fp, "updated_at": at}),
+        None => json!({"encrypted": false, "fingerprint": null, "updated_at": null}),
+    })
+}
+
+async fn set_key(state: &State, a: &Account, key: Option<&str>) -> Result<(), ApiError> {
+    match key {
+        Some(k) => {
+            let fp = parse_encryption_key(k).await?;
+            state.db.set_encryption_key(a.id, Some((k.trim(), &fp))).await?;
+            state.event("info", "security", &format!("mail to {} is now encrypted at rest to key {fp}", a.email));
+        }
+        None => {
+            state.db.set_encryption_key(a.id, None).await?;
+            state.event("warn", "security", &format!("encryption at rest turned off for {}", a.email));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct PublicKeyBody {
+    public_key: String,
+}
+
+async fn me_get_key(AxState(state): AxState<State>, headers: HeaderMap) -> R {
+    let a = me_account(&state, &headers, false).await?;
+    Ok(Json(key_json(&state, a.id).await?))
+}
+
+async fn me_put_key(AxState(state): AxState<State>, headers: HeaderMap, Json(b): Json<PublicKeyBody>) -> R {
+    let a = me_account(&state, &headers, true).await?;
+    set_key(&state, &a, Some(&b.public_key)).await?;
+    Ok(Json(key_json(&state, a.id).await?))
+}
+
+async fn me_delete_key(AxState(state): AxState<State>, headers: HeaderMap) -> R {
+    let a = me_account(&state, &headers, true).await?;
+    set_key(&state, &a, None).await?;
+    Ok(Json(key_json(&state, a.id).await?))
+}
+
+async fn admin_get_key(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>) -> R {
+    admin(&state, &headers).await?;
+    let a = resolve_account(&state, &key).await?;
+    Ok(Json(key_json(&state, a.id).await?))
+}
+
+async fn admin_put_key(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>, Json(b): Json<PublicKeyBody>) -> R {
+    admin(&state, &headers).await?;
+    let a = resolve_account(&state, &key).await?;
+    set_key(&state, &a, Some(&b.public_key)).await?;
+    Ok(Json(key_json(&state, a.id).await?))
+}
+
+async fn admin_delete_key(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>) -> R {
+    admin(&state, &headers).await?;
+    let a = resolve_account(&state, &key).await?;
+    set_key(&state, &a, None).await?;
+    Ok(Json(key_json(&state, a.id).await?))
 }
 
 async fn me_addresses(AxState(state): AxState<State>, headers: HeaderMap) -> R {

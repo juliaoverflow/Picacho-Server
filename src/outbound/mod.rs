@@ -57,6 +57,15 @@ pub struct Dsn {
     pub envid: String,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub rcpts: std::collections::BTreeMap<String, RcptDsn>,
+    /// DELIVERBY (RFC 2852): deliver by this time (unix seconds)...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<i64>,
+    /// ...or return it ("R") / just report it late ("N").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by_mode: String,
+    /// MT-PRIORITY (RFC 6710), -9 to 9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i8>,
 }
 
 impl Dsn {
@@ -64,7 +73,7 @@ impl Dsn {
         self.rcpts.get(addr).cloned().unwrap_or_default()
     }
     pub fn is_empty(&self) -> bool {
-        self.ret.is_empty() && self.envid.is_empty() && self.rcpts.is_empty()
+        self.ret.is_empty() && self.envid.is_empty() && self.rcpts.is_empty() && self.by.is_none() && self.priority.is_none()
     }
     pub fn to_json(&self) -> String {
         if self.is_empty() {
@@ -365,6 +374,14 @@ impl Client {
         }
         if m.requiretls {
             mail.push_str(" REQUIRETLS");
+        }
+        // DELIVERBY: the time left, where the next server takes it.
+        if let (Some(by), true) = (m.dsn.by, self.has("DELIVERBY")) {
+            let left = (by - crate::util::now()).max(1);
+            mail.push_str(&format!(" BY={left};{}", if m.dsn.by_mode.is_empty() { "R" } else { &m.dsn.by_mode }));
+        }
+        if let (Some(p), true) = (m.dsn.priority, self.has("MT-PRIORITY")) {
+            mail.push_str(&format!(" MT-PRIORITY={p}"));
         }
         if dsn_ok {
             if !m.dsn.ret.is_empty() {
