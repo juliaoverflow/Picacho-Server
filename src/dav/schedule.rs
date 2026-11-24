@@ -7,8 +7,8 @@
 //! server are answered from their calendars; others get "3.7 Invalid
 //! calendar user". Only busy times are shared, never what the events are.
 //!
-//! This server doesn't schedule implicitly (it doesn't send invitations for
-//! saved events), so it never advertises `calendar-auto-schedule`.
+//! Invitations themselves are sent when events are saved (implicit
+//! scheduling, `itip.rs`), not through the outbox.
 use super::ical::{self, Comp, Prop};
 use super::{empty, Ctx, CALDAV, DAV};
 use crate::xml::Writer;

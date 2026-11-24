@@ -111,7 +111,8 @@ fn valid_filter(f: &Element) -> bool {
 async fn query(ctx: &Ctx, t: &Target, doc: &Element, depth: &str, calendar: bool) -> Result<Response> {
     let ns = if calendar { CALDAV } else { CARDDAV };
     let Some((coll, items)) = members(ctx, t, depth).await? else { return Ok(empty(StatusCode::NOT_FOUND)) };
-    let home_ok = coll.kind == if calendar { "calendar-home" } else { "addressbook-home" };
+    // The scheduling inbox holds calendar objects too (RFC 6638 2.2).
+    let home_ok = coll.kind == if calendar { "calendar-home" } else { "addressbook-home" } || (calendar && coll.kind == "schedule-inbox");
     if coll.collection && !home_ok && ((calendar && !coll.is_calendar()) || (!calendar && !coll.is_addressbook())) {
         return Ok(precondition(StatusCode::FORBIDDEN, DAV, "supported-report"));
     }

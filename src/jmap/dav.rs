@@ -599,7 +599,7 @@ fn target_collection(kind: Kind, o: &Map<String, Value>, colls: &[Node], ctx: &C
     }
 }
 
-async fn write_object(ctx: &Ctx, p: &Principal, kind: Kind, coll: &Node, existing: Option<&Node>, o: &Map<String, Value>) -> Result<Result<Node, Value>, MethodError> {
+async fn write_object(ctx: &Ctx, p: &Principal, kind: Kind, coll: &Node, existing: Option<&Node>, o: &Map<String, Value>, schedule: bool) -> Result<Result<Node, Value>, MethodError> {
     let current = match existing {
         Some(n) => ical::parse(&store::read(&ctx.state, n).await?).ok(),
         None => None,
@@ -608,6 +608,19 @@ async fn write_object(ctx: &Ctx, p: &Principal, kind: Kind, coll: &Node, existin
     let comp = match comp {
         Ok(c) => c,
         Err(e) => return Ok(Err(set_error("invalidProperties", e))),
+    };
+    // sendSchedulingMessages: the server tells the participants (RFC 6638).
+    let comp = if schedule && kind == Kind::Event && crate::dav::itip::on(&ctx.state) {
+        match crate::dav::itip::on_change(&ctx.state, p, crate::dav::itip::Change { old: current.as_ref(), new: Some(&comp), no_reply: false }).await {
+            Ok(Some(c)) => c,
+            Ok(None) => comp,
+            Err(e) => {
+                tracing::warn!("scheduling: {e:#}");
+                comp
+            }
+        }
+    } else {
+        comp
     };
     let text = ical::serialize(&comp);
     // A move to another collection: store there, then remove the old one.
@@ -645,6 +658,7 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
     let (mut updated, mut not_updated) = (Map::new(), Map::new());
     let (mut destroyed, mut not_destroyed) = (vec![], Map::new());
     let colls = collections(ctx, &p, kind).await?;
+    let schedule = args.get("sendSchedulingMessages").and_then(|v| v.as_bool()).unwrap_or(false);
     if let Some(c) = args.get("create").and_then(|v| v.as_object()) {
         for (cid, obj) in c {
             let Some(o) = obj.as_object() else {
@@ -693,7 +707,7 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
                 not_created.insert(cid.clone(), set_error("invalidProperties", "Name exactly one calendar or address book"));
                 continue;
             };
-            match write_object(ctx, &p, kind, &coll, None, &o).await? {
+            match write_object(ctx, &p, kind, &coll, None, &o, schedule).await? {
                 Ok(n) => {
                     let id = format!("{}{}", kind.prefix(), n.id);
                     ctx.created.insert(cid.clone(), id.clone());
@@ -776,7 +790,7 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
                 not_updated.insert(id, set_error("invalidProperties", "Name exactly one calendar or address book"));
                 continue;
             };
-            match write_object(ctx, &p, kind, &coll, Some(&node), &current).await? {
+            match write_object(ctx, &p, kind, &coll, Some(&node), &current, schedule).await? {
                 Ok(n) if n.id != node.id => {
                     // Moved to another collection: a new resource there.
                     updated.insert(id, json!({"id": format!("{}{}", kind.prefix(), n.id)}));
@@ -811,7 +825,13 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
                 not_destroyed.insert(id, set_error(if kind == Kind::Calendar { "calendarHasEvent" } else { "addressBookHasContents" }, "It isn't empty"));
                 continue;
             }
+            let before = if schedule && kind == Kind::Event && crate::dav::itip::on(&ctx.state) { ical::parse(&store::read(&ctx.state, &node).await?).ok() } else { None };
             if store::delete(&ctx.state, &p, &node.path).await? {
+                if let Some(old) = &before {
+                    if let Err(e) = crate::dav::itip::on_change(&ctx.state, &p, crate::dav::itip::Change { old: Some(old), new: None, no_reply: false }).await {
+                        tracing::warn!("scheduling: {e:#}");
+                    }
+                }
                 destroyed.push(id);
             } else {
                 not_destroyed.insert(id, set_error("forbidden", "Can't be removed"));
@@ -871,7 +891,7 @@ async fn copy(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodEr
             not_created.insert(cid.clone(), set_error("invalidProperties", "Name exactly one calendar or address book"));
             continue;
         };
-        match write_object(ctx, &p, kind, &coll, None, &o).await? {
+        match write_object(ctx, &p, kind, &coll, None, &o, false).await? {
             Ok(n) => {
                 let id = format!("{}{}", kind.prefix(), n.id);
                 ctx.created.insert(cid.clone(), id.clone());

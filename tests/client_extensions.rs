@@ -797,7 +797,7 @@ async fn web_key_directory_publishes_account_keys() {
 
 async fn dav(s: &Srv, user: &str, method: &str, path: &str, ctype: &str, body: &str) -> (u16, String) {
     // PROPFIND on a collection lists its members (Depth: 1).
-    let depth = if method == "PROPFIND" && path.ends_with('/') && !path.contains("/principals/") && path != "/dav/" { "1" } else { "0" };
+    let depth = if matches!(method, "PROPFIND" | "REPORT") && path.ends_with('/') && !path.contains("/principals/") && path != "/dav/" { "1" } else { "0" };
     let r = reqwest::Client::new()
         .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("http://{}{path}", s.web))
         .basic_auth(user, Some("Correct-Horse-9"))
@@ -949,6 +949,127 @@ async fn caldav_managed_attachments() {
     assert_eq!(st, 204);
     let r = c.get(format!("{base}/dav/calendars/bob@example.test/attachments/{id3}")).basic_auth("bob@example.test", Some("Correct-Horse-9")).send().await.unwrap();
     assert_eq!(r.status(), 404);
+}
+
+#[tokio::test]
+async fn caldav_server_scheduling() {
+    let s = server().await;
+    let c = reqwest::Client::new();
+    let base = format!("http://{}", s.web);
+    let opts = |c: &reqwest::Client| c.request(reqwest::Method::OPTIONS, format!("{base}/dav/calendars/bob@example.test/"));
+    assert!(!opts(&c).send().await.unwrap().headers()["dav"].to_str().unwrap().contains("calendar-auto-schedule"), "off by default");
+    let mut set = (*s.state.settings()).clone();
+    set.dav.server_scheduling = true;
+    s.state.save_settings(set).await.unwrap();
+    s.state.db.domain_by_name("example.test").await.unwrap().unwrap();
+    // As the app finds out (sync/caldav.rs `schedules`, `scheduling_identity`).
+    assert!(opts(&c).send().await.unwrap().headers()["dav"].to_str().unwrap().contains("calendar-auto-schedule"));
+    for who in ["bob@example.test", "amy@example.test"] {
+        let (st, body) = dav(&s, who, "PROPFIND", &format!("/dav/principals/{who}/"), "application/xml",
+            "<propfind xmlns=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><prop><C:schedule-inbox-URL/></prop></propfind>").await;
+        assert_eq!(st, 207);
+        assert!(body.contains(&format!("/dav/calendars/{who}/inbox/")), "{body}");
+    }
+    let (_, body) = dav(&s, "amy@example.test", "PROPFIND", "/dav/calendars/amy@example.test/inbox/", "application/xml",
+        "<propfind xmlns=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><prop><resourcetype/><C:schedule-default-calendar-URL/></prop></propfind>").await;
+    assert!(body.contains("<C:schedule-inbox/>") && body.contains("schedule-default-calendar-URL><D:href>/dav/calendars/amy@example.test/default/"), "{body}");
+
+    // Bob invites Amy (here) and Cy (elsewhere).
+    let ev = |seq: &str, start: &str, extra: &str| format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:meet-1\r\nDTSTAMP:20261101T000000Z\r\nDTSTART:{start}\r\nDURATION:PT1H\r\nSUMMARY:Planning\r\n{seq}\
+         ORGANIZER;CN=Bob:mailto:bob@example.test\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:bob@example.test\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:amy@example.test\r\n{extra}END:VEVENT\r\nEND:VCALENDAR\r\n");
+    let bob_href = "/dav/calendars/bob@example.test/default/meet-1.ics";
+    let (st, _) = dav(&s, "bob@example.test", "PUT", bob_href, "text/calendar", &ev("", "20261201T100000Z", "ATTENDEE:mailto:cy@elsewhere.test\r\n")).await;
+    assert_eq!(st, 201);
+    let (_, ics) = dav(&s, "bob@example.test", "GET", bob_href, "", "").await;
+    let ics = ics.replace("\r\n ", "");
+    assert!(ics.contains("SCHEDULE-STATUS=1.2:mailto:amy@example.test"), "{ics}");
+    assert!(ics.contains("SCHEDULE-STATUS=1.1:mailto:cy@elsewhere.test"), "{ics}");
+    // Cy gets an iMIP email from Bob's address.
+    let q = s.state.db.due_queue(10).await.unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].recipients, ["cy@elsewhere.test"]);
+    let mail = String::from_utf8_lossy(&s.state.blobs.get(&q[0].blob).await.unwrap()).to_string();
+    assert!(mail.contains("From: \"Bob\" <bob@example.test>") && mail.contains("text/calendar; charset=utf-8; method=REQUEST"), "{mail}");
+    // Amy: the request in her inbox, the event in her calendar.
+    let inbox = "<C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"/></C:filter></C:calendar-query>";
+    let (st, body) = dav(&s, "amy@example.test", "REPORT", "/dav/calendars/amy@example.test/inbox/", "application/xml", inbox).await;
+    assert_eq!(st, 207);
+    assert!(body.contains("METHOD:REQUEST") && body.contains("UID:meet-1") && !body.contains("SCHEDULE-STATUS"), "{body}");
+    let amy_href = "/dav/calendars/amy@example.test/default/meet-1.ics";
+    let (st, amy_ics) = dav(&s, "amy@example.test", "GET", amy_href, "", "").await;
+    assert_eq!(st, 200, "the invitation is in Amy's calendar");
+    assert!(amy_ics.contains("SUMMARY:Planning") && !amy_ics.contains("METHOD"), "{amy_ics}");
+    // She clears her inbox, as the app does after reading it.
+    let item = body.split("<D:href>").nth(1).unwrap().split("</D:href>").next().unwrap().to_string();
+    let (st, _) = dav(&s, "amy@example.test", "DELETE", &item, "", "").await;
+    assert_eq!(st, 204);
+    let (st, _) = dav(&s, "amy@example.test", "PUT", "/dav/calendars/amy@example.test/inbox/x.ics", "text/calendar", &ev("", "20261201T100000Z", "")).await;
+    assert_eq!(st, 403, "clients don't put things in the inbox");
+
+    // Amy accepts: Bob gets a REPLY and his copy says so.
+    let accepted = amy_ics.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED");
+    let (st, _) = dav(&s, "amy@example.test", "PUT", amy_href, "text/calendar", &accepted).await;
+    assert_eq!(st, 204);
+    let (_, body) = dav(&s, "bob@example.test", "REPORT", "/dav/calendars/bob@example.test/inbox/", "application/xml", inbox).await;
+    assert!(body.contains("METHOD:REPLY") && body.contains("PARTSTAT=ACCEPTED"), "{body}");
+    let (_, ics) = dav(&s, "bob@example.test", "GET", bob_href, "", "").await;
+    assert!(ics.replace("\r\n ", "").contains("PARTSTAT=ACCEPTED;SCHEDULE-STATUS=2.0:mailto:amy@example.test"), "{ics}");
+
+    // Bob changes only the summary: Amy's answer stays. Moving it asks again.
+    let (_, ics) = dav(&s, "bob@example.test", "GET", bob_href, "", "").await;
+    let (st, _) = dav(&s, "bob@example.test", "PUT", bob_href, "text/calendar", &ics.replace("SUMMARY:Planning", "SUMMARY:Planning v2")).await;
+    assert_eq!(st, 204);
+    let (_, a) = dav(&s, "amy@example.test", "GET", amy_href, "", "").await;
+    assert!(a.contains("SUMMARY:Planning v2") && a.contains("PARTSTAT=ACCEPTED:mailto:amy@example.test"), "{a}");
+    assert!(a.contains("SEQUENCE:1"), "{a}");
+    let (_, ics) = dav(&s, "bob@example.test", "GET", bob_href, "", "").await;
+    dav(&s, "bob@example.test", "PUT", bob_href, "text/calendar", &ics.replace("DTSTART:20261201T100000Z", "DTSTART:20261202T100000Z")).await;
+    let (_, a) = dav(&s, "amy@example.test", "GET", amy_href, "", "").await;
+    assert!(a.contains("DTSTART:20261202T100000Z") && a.contains("NEEDS-ACTION"), "{a}");
+
+    // Schedule-Reply: F keeps an answer to oneself.
+    let (_, before) = dav(&s, "bob@example.test", "REPORT", "/dav/calendars/bob@example.test/inbox/", "application/xml", inbox).await;
+    let r = c.put(format!("{base}{amy_href}")).basic_auth("amy@example.test", Some("Correct-Horse-9")).header("content-type", "text/calendar").header("schedule-reply", "F")
+        .body(a.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=TENTATIVE")).send().await.unwrap();
+    assert_eq!(r.status(), 204);
+    let (_, after) = dav(&s, "bob@example.test", "REPORT", "/dav/calendars/bob@example.test/inbox/", "application/xml", inbox).await;
+    assert_eq!(before.matches("<D:response>").count(), after.matches("<D:response>").count());
+
+    // Bob cancels: Amy's copy is marked cancelled, Cy is mailed again.
+    let (st, _) = dav(&s, "bob@example.test", "DELETE", bob_href, "", "").await;
+    assert_eq!(st, 204);
+    let (_, a) = dav(&s, "amy@example.test", "GET", amy_href, "", "").await;
+    assert!(a.contains("STATUS:CANCELLED"), "{a}");
+    let mut cancelled = false;
+    for x in s.state.db.due_queue(20).await.unwrap() {
+        cancelled |= String::from_utf8_lossy(&s.state.blobs.get(&x.blob).await.unwrap()).contains("method=CANCEL");
+    }
+    assert!(cancelled, "Cy is told it's off");
+    // Amy removing the cancelled event sends Bob nothing.
+    let (_, before) = dav(&s, "bob@example.test", "REPORT", "/dav/calendars/bob@example.test/inbox/", "application/xml", inbox).await;
+    let (st, _) = dav(&s, "amy@example.test", "DELETE", amy_href, "", "").await;
+    assert_eq!(st, 204);
+    let (_, after) = dav(&s, "bob@example.test", "REPORT", "/dav/calendars/bob@example.test/inbox/", "application/xml", inbox).await;
+    assert_eq!(before.matches("<D:response>").count(), after.matches("<D:response>").count());
+
+    // A client that schedules itself (SCHEDULE-AGENT=CLIENT) sends nothing.
+    let quiet = ev("", "20261205T100000Z", "").replace("ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:", "ATTENDEE;SCHEDULE-AGENT=CLIENT;PARTSTAT=NEEDS-ACTION:").replace("ORGANIZER;CN=Bob:", "ORGANIZER;SCHEDULE-AGENT=CLIENT;CN=Bob:").replace("meet-1", "meet-2");
+    dav(&s, "bob@example.test", "PUT", "/dav/calendars/bob@example.test/default/meet-2.ics", "text/calendar", &quiet).await;
+    let (st, _) = dav(&s, "amy@example.test", "GET", "/dav/calendars/amy@example.test/default/meet-2.ics", "", "").await;
+    assert_eq!(st, 404);
+
+    // JMAP: sendSchedulingMessages has the server invite (sync/jscal.rs `save_event_scheduled`).
+    let (bob, _) = Jmap::new(&s, "bob@example.test").await;
+    let cal = bob.one("Calendar/get", serde_json::json!({"ids": null})).await["list"][0]["id"].as_str().unwrap().to_string();
+    let e = serde_json::json!({"@type": "Event", "uid": "jmap-meet", "title": "Sync", "start": "2026-12-09T10:00:00", "timeZone": "Etc/UTC", "duration": "PT30M",
+        "calendarIds": {&cal: true},
+        "participants": {"o": {"@type": "Participant", "sendTo": {"imip": "mailto:bob@example.test"}, "roles": {"owner": true, "attendee": true}, "scheduleAgent": "server"},
+                         "a": {"@type": "Participant", "sendTo": {"imip": "mailto:amy@example.test"}, "roles": {"attendee": true}, "participationStatus": "needs-action", "scheduleAgent": "server"}}});
+    let r = bob.one("CalendarEvent/set", serde_json::json!({"create": {"e": e}, "sendSchedulingMessages": true})).await;
+    assert!(r["created"]["e"]["id"].is_string(), "{r}");
+    let (_, body) = dav(&s, "amy@example.test", "REPORT", "/dav/calendars/amy@example.test/default/", "application/xml", inbox).await;
+    assert!(body.contains("UID:jmap-meet"), "{body}");
 }
 
 // ------------------------------------------------------------ POP3

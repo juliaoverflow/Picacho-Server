@@ -293,11 +293,15 @@ pub struct DavSettings {
     /// Let calendar apps look up when other people on this server are busy
     /// (RFC 6638 free/busy; times only, never what the events are).
     pub free_busy_lookup: bool,
+    /// Send invitations, updates, cancellations and answers when people
+    /// save events (RFC 6638 implicit scheduling): to mailboxes here
+    /// directly, to everyone else by email from the organizer's address.
+    pub server_scheduling: bool,
 }
 
 impl Default for DavSettings {
     fn default() -> Self {
-        Self { enabled: true, mail_accounts: true, default_quota_mb: 10 * 1024, max_resource_bytes: 1024 * 1024 * 1024, create_defaults: true, free_busy_lookup: true }
+        Self { enabled: true, mail_accounts: true, default_quota_mb: 10 * 1024, max_resource_bytes: 1024 * 1024 * 1024, create_defaults: true, free_busy_lookup: true, server_scheduling: false }
     }
 }
 

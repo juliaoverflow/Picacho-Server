@@ -78,7 +78,7 @@ fn writable(ns: &str, name: &str) -> Option<&'static str> {
 
 fn protected(ns: &str, name: &str) -> bool {
     LIVE.iter().any(|(n, x)| *n == ns && *x == name && name != "displayname")
-        || matches!((ns, name), (CALDAV, "supported-calendar-component-set") | (CALDAV, "supported-calendar-data") | (CALDAV, "max-resource-size") | (CARDDAV, "supported-address-data") | (CARDDAV, "max-resource-size") | (CALDAV, "calendar-home-set") | (CARDDAV, "addressbook-home-set") | (DAV, "principal-URL") | (CALDAV, "schedule-outbox-URL") | (CALDAV, "max-attachment-size") | (CALDAV, "max-attachments-per-resource"))
+        || matches!((ns, name), (CALDAV, "supported-calendar-component-set") | (CALDAV, "supported-calendar-data") | (CALDAV, "max-resource-size") | (CARDDAV, "supported-address-data") | (CARDDAV, "max-resource-size") | (CALDAV, "calendar-home-set") | (CARDDAV, "addressbook-home-set") | (DAV, "principal-URL") | (CALDAV, "schedule-outbox-URL") | (CALDAV, "schedule-inbox-URL") | (CALDAV, "max-attachment-size") | (CALDAV, "max-attachments-per-resource"))
 }
 
 fn dead_key(ns: &str, name: &str) -> String {
@@ -143,6 +143,7 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
             match res {
                 Res::Principal(_) => w.empty(DAV, "principal"),
                 Res::Node(n) if n.is_calendar() => w.empty(CALDAV, "calendar"),
+                Res::Node(n) if n.kind == "schedule-inbox" => w.empty(CALDAV, "schedule-inbox"),
                 Res::Node(n) if n.is_addressbook() => w.empty(CARDDAV, "addressbook"),
                 _ => {}
             }
@@ -268,6 +269,7 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
         }
         (DAV, "supported-report-set") => {
             let reports: Vec<(&str, &str)> = match res {
+                Res::Node(n) if n.kind == "schedule-inbox" => vec![(CALDAV, "calendar-query"), (CALDAV, "calendar-multiget"), (DAV, "sync-collection")],
                 Res::Node(n) if n.is_calendar() => vec![(CALDAV, "calendar-query"), (CALDAV, "calendar-multiget"), (CALDAV, "free-busy-query"), (DAV, "sync-collection"), (DAV, "expand-property")],
                 Res::Node(n) if n.is_addressbook() => vec![(CARDDAV, "addressbook-query"), (CARDDAV, "addressbook-multiget"), (DAV, "sync-collection"), (DAV, "expand-property")],
                 Res::Node(n) if n.collection => vec![(DAV, "sync-collection"), (DAV, "expand-property")],
@@ -347,6 +349,25 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
             Res::Principal(p) => {
                 w.open(ns, name);
                 w.text_el(DAV, "href", &format!("/dav/calendars/{}/outbox/", pct_encode(&p.username)));
+                w.close(ns, name);
+            }
+            _ => return false,
+        },
+        // RFC 6638 2.2: where the server delivers scheduling messages.
+        (CALDAV, "schedule-inbox-URL") => match res {
+            Res::Principal(p) if itip::on(st) => {
+                w.open(ns, name);
+                w.text_el(DAV, "href", &format!("/dav/calendars/{}/inbox/", pct_encode(&p.username)));
+                w.close(ns, name);
+            }
+            _ => return false,
+        },
+        // RFC 6638 9.2: the calendar invitations go into.
+        (CALDAV, "schedule-default-calendar-URL") => match node {
+            Some(n) if n.kind == "schedule-inbox" => {
+                let Ok(Some(c)) = itip::default_calendar(st, ctx.principal.id).await else { return false };
+                w.open(ns, name);
+                w.text_el(DAV, "href", &href_node(&user, &c.path, true));
                 w.close(ns, name);
             }
             _ => return false,
@@ -669,6 +690,22 @@ pub async fn proppatch(ctx: &Ctx, t: &Target, h: &HeaderMap, body: &[u8]) -> Res
         }
         let Some(p) = op.child(DAV, "prop") else { continue };
         for e in p.elements() {
+            if e.is(CALDAV, "schedule-default-calendar-URL") && n.kind == "schedule-inbox" {
+                // Set to one of one's calendars (RFC 6638 9.2.1), or removed.
+                let to = e.child(DAV, "href").map(|h| h.text()).and_then(|h| target(h.trim()));
+                match (set, to) {
+                    (false, _) => {
+                        props.remove("default-calendar");
+                        results.push((e.ns.clone(), e.name.clone(), StatusCode::OK));
+                    }
+                    (true, Some(Target::Node(u, cp))) if u == ctx.principal.username && ctx.state.db.dav_node(ctx.principal.id, &cp).await?.is_some_and(|c| c.is_calendar()) => {
+                        props.insert("default-calendar".into(), json!(cp));
+                        results.push((e.ns.clone(), e.name.clone(), StatusCode::OK));
+                    }
+                    _ => results.push((e.ns.clone(), e.name.clone(), StatusCode::CONFLICT)),
+                }
+                continue;
+            }
             if set {
                 if e.is(CALDAV, "supported-calendar-component-set") || protected(&e.ns, &e.name) {
                     results.push((e.ns.clone(), e.name.clone(), StatusCode::FORBIDDEN));

@@ -14,6 +14,7 @@
 //! (`[storage.dav]`), defaulting to the message store's backend.
 pub mod attach;
 pub mod ical;
+pub mod itip;
 pub mod jscal;
 mod directory;
 mod locks;
@@ -453,11 +454,15 @@ pub async fn ensure_homes(state: &State, p: &Principal) -> Result<()> {
             state.db.dav_put(p.id, &NewNode { path, collection: true, kind, blob: "", size: 0, etag: "", ctype: "", props: &empty, uid: "", comp: "", dtstart: None, dtend: None }).await?;
         }
     }
+    if itip::on(state) {
+        itip::ensure_inbox(state, p.id).await?;
+    }
     if state.settings().dav.create_defaults {
         let mut cal = Map::new();
         cal.insert("displayname".into(), json!("Calendar"));
         cal.insert("components".into(), json!("VEVENT,VTODO"));
-        if state.db.dav_children(p.id, "calendars").await?.is_empty() {
+        // The inbox and attachments collections don't count as calendars.
+        if !state.db.dav_children(p.id, "calendars").await?.iter().any(|c| c.is_calendar()) {
             state.db.dav_put(p.id, &NewNode { path: "calendars/default", collection: true, kind: "calendar", blob: "", size: 0, etag: "", ctype: "", props: &cal, uid: "", comp: "", dtstart: None, dtend: None }).await?;
         }
         let mut ab = Map::new();
@@ -711,10 +716,17 @@ async fn well_known() -> Response {
 
 pub const ALLOW: &str = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MKCALENDAR, COPY, MOVE, LOCK, UNLOCK, REPORT, POST";
 
-fn options() -> Response {
+fn options(state: &State) -> Response {
     let mut r = empty(StatusCode::OK);
     let h = r.headers_mut();
-    h.insert("DAV", HeaderValue::from_static("1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol, calendar-managed-attachments"));
+    // calendar-auto-schedule only when the server sends invitations itself:
+    // clients then stop emailing them.
+    let classes = if itip::on(state) {
+        "1, 2, 3, access-control, calendar-access, calendar-auto-schedule, addressbook, extended-mkcol, calendar-managed-attachments"
+    } else {
+        "1, 2, 3, access-control, calendar-access, addressbook, extended-mkcol, calendar-managed-attachments"
+    };
+    h.insert("DAV", HeaderValue::from_static(classes));
     h.insert(header::ALLOW, HeaderValue::from_static(ALLOW));
     h.insert("MS-Author-Via", HeaderValue::from_static("DAV"));
     r
@@ -727,7 +739,7 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
     }
     let method = req.method().clone();
     if method == Method::OPTIONS {
-        return options();
+        return options(&state);
     }
     let headers = req.headers().clone();
     let path = req.uri().path().to_string();
@@ -795,6 +807,13 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
     if writes && !matches!(method.as_str(), "POST" | "LOCK" | "UNLOCK") {
         let dest = headers.get("destination").and_then(|v| v.to_str().ok()).and_then(target);
         if [Some(&t), dest.as_ref()].into_iter().flatten().any(|x| matches!(x, Target::Node(_, p) if attach::touches(p))) {
+            return precondition(StatusCode::FORBIDDEN, DAV, "need-privileges");
+        }
+        // The scheduling inbox is filled by the server; clients only delete from it.
+        let inbox = |x: &Target| {
+            matches!(x, Target::Node(_, p) if (p == itip::INBOX && method.as_str() != "PROPPATCH") || (p.starts_with(&format!("{}/", itip::INBOX)) && method != Method::DELETE))
+        };
+        if [Some(&t), dest.as_ref()].into_iter().flatten().any(inbox) {
             return precondition(StatusCode::FORBIDDEN, DAV, "need-privileges");
         }
     }
@@ -1193,6 +1212,25 @@ async fn put(ctx: &Ctx, t: &Target, h: &HeaderMap, body: Bytes) -> Result<Respon
         Err(r) => return Ok(r),
     };
     let ContentMeta { uid, comp, dtstart, dtend, ctype } = meta;
+    // Implicit scheduling (RFC 6638): may add SCHEDULE-STATUS and SEQUENCE.
+    let body: Bytes = if parent.is_calendar() && itip::on(st) {
+        let old = match &existing {
+            Some(n) => ical::parse(&String::from_utf8_lossy(&read_blob(st, n).await?)).ok(),
+            None => None,
+        };
+        let new = ical::parse(&String::from_utf8_lossy(&body)).ok();
+        let no_reply = header_str(h, "schedule-reply").is_some_and(|v| v.trim().eq_ignore_ascii_case("F"));
+        match itip::on_change(st, &ctx.principal, itip::Change { old: old.as_ref(), new: new.as_ref(), no_reply }).await {
+            Ok(Some(c)) => Bytes::from(ical::serialize(&c)),
+            Ok(None) => body,
+            Err(e) => {
+                tracing::warn!("scheduling {path}: {e:#}");
+                body
+            }
+        }
+    } else {
+        body
+    };
     let old_size = existing.as_ref().map(|n| n.size).unwrap_or(0);
     let quota = ctx.principal.quota_bytes;
     let used = st.db.dav_principal_by_id(pid).await?.map(|p| p.used_bytes).unwrap_or(0);
@@ -1317,7 +1355,18 @@ async fn delete(ctx: &Ctx, t: &Target, h: &HeaderMap) -> Result<Response> {
     if let Some(r) = locks::check_write(ctx, user, path, h, n.collection).await? {
         return Ok(r);
     }
+    let old = if !n.collection && n.section() == "calendars" && itip::on(st) && !path.starts_with(itip::INBOX) {
+        ical::parse(&String::from_utf8_lossy(&read_blob(st, &n).await?)).ok()
+    } else {
+        None
+    };
     remove_tree(ctx, path).await?;
+    if let Some(old) = &old {
+        let no_reply = header_str(h, "schedule-reply").is_some_and(|v| v.trim().eq_ignore_ascii_case("F"));
+        if let Err(e) = itip::on_change(st, &ctx.principal, itip::Change { old: Some(old), new: None, no_reply }).await {
+            tracing::warn!("scheduling {path}: {e:#}");
+        }
+    }
     if n.section() == "calendars" && !attach::touches(path) {
         attach::sweep(ctx).await?;
     }

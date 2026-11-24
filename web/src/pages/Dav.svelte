@@ -176,6 +176,7 @@
       <Toggle bind:checked={dav.mail_accounts} label="Every mail account gets calendars and contacts" hint="Created on first use with the mail password or an app password." disabled={!dav.enabled} />
       <Toggle bind:checked={dav.create_defaults} label="Create a default calendar and address book" disabled={!dav.enabled} />
       <Toggle bind:checked={dav.free_busy_lookup} label="Let people see when others here are busy" hint="Calendar apps can look up busy times (never event details) of other mailboxes on this server when scheduling." disabled={!dav.enabled} />
+      <Toggle bind:checked={dav.server_scheduling} label="Send invitations for calendar apps" hint="When someone saves an event with guests, this server invites them, sends updates and cancellations, and passes answers back: straight into calendars here, by email from the organizer's address to everyone else. Apps that support it (RFC 6638) then stop emailing invitations themselves." disabled={!dav.enabled} />
       <div class="grid2" style="margin-top:10px">
         <label class="field"><span>Default file quota (MB)</span><input class="input" type="number" min="0" bind:value={dav.default_quota_mb} /><span class="hint">0 means unlimited.</span></label>
         <label class="field"><span>Largest uploaded file (MB)</span><input class="input" type="number" min="1" value={mb(dav.max_resource_bytes)} onchange={(e) => (dav.max_resource_bytes = Math.max(1, Number(e.target.value)) * 1048576)} /></label>
