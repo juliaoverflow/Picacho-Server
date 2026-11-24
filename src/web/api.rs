@@ -75,6 +75,7 @@ pub fn routes(state: State) -> Router {
         .route("/api/setup/storage/test", post(setup_storage_test))
         .route("/api/oidc/test", post(oidc_test))
         .route("/api/admin/ldap/test", post(ldap_test))
+        .route("/api/admin/cloudflare/worker", post(cloudflare_worker))
         .route("/api/auth/oidc/start", get(oidc_start))
         .route("/api/auth/oidc/callback", get(oidc_callback))
         .route("/api/setup/verify", post(setup_verify))
@@ -1356,6 +1357,21 @@ async fn put_settings(AxState(state): AxState<State>, headers: HeaderMap, Json(m
     state.save_settings(s).await?;
     state.event("info", "admin", &format!("{} saved settings", who.email));
     Ok(Json(json!({"settings": state.settings().redacted()})))
+}
+
+/// Turn on receiving through a Cloudflare Email Worker with a new secret,
+/// and return it with the Worker to deploy (the secret is shown only here).
+async fn cloudflare_worker(AxState(state): AxState<State>, headers: HeaderMap) -> R {
+    let who = admin(&state, &headers).await?;
+    let secret = crate::util::random_token();
+    let mut s = (*state.settings()).clone();
+    s.relay.cloudflare_inbound.enabled = true;
+    s.relay.cloudflare_inbound.secret = Some(secret.clone());
+    s.validate().map_err(bad)?;
+    state.save_settings(s).await?;
+    state.event("info", "admin", &format!("{} set up receiving through Cloudflare Email Workers", who.email));
+    let url = state.config.web.public_url.clone().unwrap_or_else(|| crate::jmap::base_url(&state, &headers));
+    Ok(Json(json!({"secret": secret, "url": url.trim_end_matches('/'), "worker": crate::cloudflare::WORKER, "settings": state.settings().redacted()})))
 }
 
 #[derive(Deserialize)]

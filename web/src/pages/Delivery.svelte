@@ -18,9 +18,10 @@
   let sending = $state(false);
 
   const d = $derived(s.data?.delivery);
-  const KIND = { direct: 'Direct MX', smtp: 'SMTP relay', webhook: 'Webhook' };
+  const KIND = { direct: 'Direct MX', smtp: 'SMTP relay', webhook: 'Webhook', cloudflare: 'Cloudflare Email Service' };
 
   function blank(kind = 'smtp') {
+    if (kind === 'cloudflare') return { id: 'cloudflare', name: 'Cloudflare Email Service', kind, host: 'smtp.mx.cloudflare.net', port: 465, tls: 'tls', username: 'api_token', password: '', url: '', secret: '', format: 'json' };
     return { id: '', name: '', kind, host: '', port: kind === 'smtp' ? 587 : 0, tls: 'starttls', username: '', password: '', url: '', secret: '', format: 'json' };
   }
   function openNew(kind) {
@@ -36,7 +37,7 @@
     editing = true;
   }
   function applyPreset(p) {
-    t = { ...t, host: p.host, port: p.port, tls: p.tls, username: p.username ?? t.username, name: t.name || p.name, id: t.id || p.id };
+    t = { ...t, kind: p.kind ?? t.kind, host: p.host, port: p.port, tls: p.tls, username: p.username ?? t.username, name: t.name || p.name, id: t.id || p.id };
   }
   function slug(v) {
     return v.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
@@ -103,6 +104,7 @@
         <span class="spacer"></span>
         <button class="btn small" onclick={() => openNew('smtp')}><Icon name="plus" size={16} /> SMTP relay</button>
         <button class="btn small" onclick={() => openNew('webhook')}><Icon name="link" size={16} /> Webhook</button>
+        <button class="btn small" onclick={() => openNew('cloudflare')}><Icon name="plus" size={16} /> Cloudflare</button>
       </div>
       <div class="transports">
         <div class="tr builtin"><Icon name="send" /><div class="grow"><strong>Direct MX</strong><span class="muted small">Built in · looks up each domain’s mail servers</span></div><button class="btn small" onclick={() => { t = blank('direct'); t.id = 'direct'; test(); editIndex = -2; editing = true; }}>Test</button></div>
@@ -165,7 +167,7 @@
   {/if}
 </div></div>
 
-<Modal title={editIndex === -2 ? 'Direct delivery' : editIndex >= 0 ? 'Edit transport' : t.kind === 'webhook' ? 'New webhook' : 'New SMTP relay'} bind:open={editing} width={560}>
+<Modal title={editIndex === -2 ? 'Direct delivery' : editIndex >= 0 ? 'Edit transport' : t.kind === 'webhook' ? 'New webhook' : t.kind === 'cloudflare' ? 'Cloudflare Email Service' : 'New SMTP relay'} bind:open={editing} width={560}>
   {#if editIndex === -2}
     <p class="muted">Checks DNS and whether this machine can open outbound connections on port 25.</p>
   {:else}
@@ -185,6 +187,9 @@
           <label class="field"><span>Username</span><input class="input" bind:value={t.username} autocomplete="off" /></label>
           <label class="field"><span>Password / API key</span><input class="input" type="password" bind:value={t.password} autocomplete="off" /></label>
         </div>
+      {:else if t.kind === 'cloudflare'}
+        <label class="field"><span>API token</span><input class="input" type="password" bind:value={t.password} autocomplete="off" required /><span class="hint">A Cloudflare API token with <strong>Email Sending: Edit</strong>. Your sending domains must be onboarded for Email Sending in that account.</span></label>
+        <p class="small muted" style="margin:0">Sent over SMTP to smtp.mx.cloudflare.net:465. Cloudflare signs with its own DKIM key and sets Message-ID and Date; headers it doesn't take are left out (User-Agent and the like are kept as X-Original-…). At most 50 recipients and 25 MiB per message. Cloudflare's Email Service is for transactional mail.</p>
       {:else if t.kind === 'webhook'}
         <label class="field"><span>URL</span><input class="input mono" type="url" bind:value={t.url} placeholder="https://app.example.com/inbound-mail" required /></label>
         <div class="grid2">

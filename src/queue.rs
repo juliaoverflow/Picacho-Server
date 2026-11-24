@@ -152,6 +152,7 @@ async fn process(state: &State, item: QueueItem) -> anyhow::Result<()> {
                 }
             }
             Some(t) if t.kind == TransportKind::Webhook => each(&rcpts, send_webhook(t, &item, &rcpts, &raw).await.into_rcpt()),
+            Some(t) if t.kind == TransportKind::Cloudflare => send_cloudflare(state, t, &item.sender, &rcpts, &raw).await,
             Some(t) if t.kind == TransportKind::Picacho => crate::relay::push(state, t, &item, &rcpts, &raw).await,
             _ => {
                 if item.route.starts_with("transport:") && transport.is_none() {
@@ -374,6 +375,34 @@ async fn send_smtp(state: &State, t: &Transport, sender: &str, rcpts: &[String],
     }
 }
 
+/// The SMTP settings Cloudflare's endpoint needs, whatever was stored.
+fn cloudflare_smtp(t: &Transport) -> Transport {
+    Transport {
+        kind: TransportKind::Smtp,
+        host: crate::cloudflare::SMTP_HOST.into(),
+        port: crate::cloudflare::SMTP_PORT,
+        tls: TlsMode::Tls,
+        username: Some(crate::cloudflare::SMTP_USER.into()),
+        password: t.password.clone(),
+        ..t.clone()
+    }
+}
+
+/// Cloudflare Email Service: trimmed to the headers it takes, at most 50
+/// recipients per session.
+async fn send_cloudflare(state: &State, t: &Transport, sender: &str, rcpts: &[String], raw: &[u8]) -> Vec<(String, RcptOutcome)> {
+    let msg = crate::cloudflare::for_sending(raw);
+    if msg.len() > crate::cloudflare::MAX_SIZE {
+        return each(rcpts, RcptOutcome::Permanent("552 5.3.4 Larger than Cloudflare Email Service takes (25 MiB)".into()));
+    }
+    let smtp = cloudflare_smtp(t);
+    let mut out = vec![];
+    for chunk in rcpts.chunks(crate::cloudflare::MAX_RCPTS) {
+        out.extend(each(chunk, send_smtp(state, &smtp, sender, chunk, &msg).await.into_rcpt()));
+    }
+    out
+}
+
 fn sign(secret: &str, ts: &str, body: &[u8]) -> String {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
     m.update(ts.as_bytes());
@@ -524,7 +553,8 @@ pub async fn send_report(state: &State, to: &str, bytes: &[u8]) -> anyhow::Resul
 /// Connectivity test for the console's "Test" button.
 pub async fn test_transport(state: &State, t: &Transport) -> Result<String, String> {
     match t.kind {
-        TransportKind::Smtp => {
+        TransportKind::Smtp | TransportKind::Cloudflare => {
+            let t = &if t.kind == TransportKind::Cloudflare { cloudflare_smtp(t) } else { t.clone() };
             let tr = smtp_transport(state, t)?;
             match tokio::time::timeout(Duration::from_secs(30), tr.test_connection()).await {
                 Ok(Ok(true)) => Ok(format!("Connected to {}:{} and authenticated.", t.host, t.port)),

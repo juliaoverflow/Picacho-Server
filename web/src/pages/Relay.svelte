@@ -19,6 +19,21 @@
   let issued = $state(null);
   let editing = $state(null);
   let removing = $state(null);
+  let worker = $state(null);
+  let settingUp = $state(false);
+
+  async function setUpWorker() {
+    if (s.dirty) return toast.error('Save or discard your changes first.');
+    settingUp = true;
+    try {
+      worker = await post('/admin/cloudflare/worker', {});
+      s.load();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      settingUp = false;
+    }
+  }
 
   async function load() {
     try {
@@ -101,6 +116,13 @@
         <Toggle bind:checked={relay.upstream.insecure} label="Accept an invalid upstream certificate" hint="For testing only." />
       {/if}
     </div>
+    <div class="card">
+      <h3>Receive through Cloudflare Email Routing</h3>
+      <p class="sub">Cloudflare takes your domains' mail (its MX records) and an Email Worker hands each message to this server over HTTPS, so port 25 doesn't need to be open here. Cloudflare checks SPF, DKIM and DMARC; this server uses its results.</p>
+      <Toggle bind:checked={relay.cloudflare_inbound.enabled} label="Accept mail from a Cloudflare Email Worker" disabled={!relay.cloudflare_inbound.secret} hint={relay.cloudflare_inbound.secret ? 'The Worker signs each message with its secret.' : 'Set up the Worker first.'} />
+      <div class="row" style="margin-top:10px"><button class="btn small" onclick={setUpWorker} disabled={settingUp}><Icon name="zap" size={15} /> {relay.cloudflare_inbound.secret ? 'New secret and Worker' : 'Set up the Worker'}</button>
+        {#if relay.cloudflare_inbound.secret}<span class="muted small">A new secret stops the deployed Worker until you update it.</span>{/if}</div>
+    </div>
     <SaveBar {s} />
   {/if}
 
@@ -155,6 +177,22 @@
   {#snippet footer()}<button class="btn primary" onclick={() => (issued = null)}>Done</button>{/snippet}
 </Modal>
 
+<Modal title="Cloudflare Email Worker" open={!!worker} width={640} onclose={() => (worker = null)}>
+  {#if worker}
+    <div class="notice warning"><Icon name="alert" size={18} /><span>Copy the secret now. It is shown only once.</span></div>
+    <ol class="steps small">
+      <li>In the Cloudflare dashboard, open your domain → <strong>Email</strong> → <strong>Email Routing</strong>, enable it, and let it add its MX records.</li>
+      <li>Under <strong>Email Workers</strong>, create a Worker and replace its code with the script below.</li>
+      <li>In the Worker's <strong>Settings → Variables</strong>, add <span class="mono">PICACHO_URL</span> = <span class="mono">{worker.url}</span> and the secret <span class="mono">PICACHO_SECRET</span>:</li>
+    </ol>
+    <div class="secret"><code>{worker.secret}</code><Copy value={worker.secret} /></div>
+    <ol class="steps small" start="4"><li>Under <strong>Routing rules</strong>, send the catch-all (or each address) to the Worker. Mail for addresses this server doesn't have is rejected at Cloudflare.</li></ol>
+    <div class="row" style="margin:6px 0"><strong class="small">Worker</strong><span class="spacer"></span><Copy value={worker.worker} label="Copy Worker" /></div>
+    <pre class="code">{worker.worker}</pre>
+  {/if}
+  {#snippet footer()}<button class="btn primary" onclick={() => (worker = null)}>Done</button>{/snippet}
+</Modal>
+
 <Modal title="Domains for {editing?.name ?? ''}" open={!!editing} width={460} onclose={() => (editing = null)}>
   {#if editing}
     <form id="peer-domains" onsubmit={saveDomains}>
@@ -179,4 +217,6 @@
   .actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
   .secret { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 9px; background: var(--surface); border: 1px solid var(--border); }
   .secret code { flex: 1; word-break: break-all; }
+  .steps { margin: 10px 0; padding-left: 20px; display: grid; gap: 6px; }
+  .code { max-height: 260px; overflow: auto; font-size: 12px; padding: 10px 12px; border-radius: 9px; background: var(--surface); border: 1px solid var(--border); }
 </style>

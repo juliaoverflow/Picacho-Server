@@ -28,6 +28,7 @@ pub fn router(state: State) -> Router {
     api::routes(state.clone())
         .merge(crate::jmap::routes(state.clone()))
         .merge(crate::relay::routes(state.clone()))
+        .merge(crate::cloudflare::routes(state.clone()))
         .merge(wellknown::routes(state.clone()))
         .merge(crate::dav::routes(state.clone()))
         .fallback(static_file)
@@ -42,7 +43,8 @@ async fn guard(
     next: Next,
 ) -> Response<Body> {
     crate::metrics::HTTP_REQUESTS.inc();
-    let is_api = req.uri().path().starts_with("/api/") && !req.uri().path().starts_with("/api/relay/");
+    // Relay peers and the Cloudflare Worker sign their requests instead.
+    let is_api = req.uri().path().starts_with("/api/") && !req.uri().path().starts_with("/api/relay/") && !req.uri().path().starts_with("/api/inbound/");
     if is_api && req.method() != Method::GET && req.method() != Method::HEAD {
         // Token-authenticated calls carry no ambient credentials, so they
         // can't be forged cross-site; cookie sessions need the header.

@@ -13,6 +13,7 @@
 pub mod acme;
 pub mod auth;
 pub mod blob;
+pub mod cloudflare;
 pub mod config;
 pub mod dav;
 pub mod db;

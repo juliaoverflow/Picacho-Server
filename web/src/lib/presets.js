@@ -7,5 +7,7 @@ export const RELAY_PRESETS = [
   { id: 'resend', name: 'Resend', host: 'smtp.resend.com', port: 465, tls: 'tls', username: 'resend' },
   { id: 'brevo', name: 'Brevo', host: 'smtp-relay.brevo.com', port: 587, tls: 'starttls' },
   { id: 'gmail', name: 'Google Workspace', host: 'smtp-relay.gmail.com', port: 587, tls: 'starttls' },
+  // Saved as a `cloudflare` transport, which trims headers Cloudflare refuses.
+  { id: 'cloudflare', kind: 'cloudflare', name: 'Cloudflare', host: 'smtp.mx.cloudflare.net', port: 465, tls: 'tls', username: 'api_token' },
   { id: 'custom', name: 'Other', host: '', port: 587, tls: 'starttls' },
 ];

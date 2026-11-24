@@ -231,7 +231,7 @@
     };
     if (outbound === 'relay') {
       const p = RELAY_PRESETS.find((x) => x.id === preset);
-      b.relay = { id: 'relay', name: p ? p.name : 'Outbound relay', kind: 'smtp', host: relay.host.trim(), port: Number(relay.port) || 587, tls: relay.tls, username: relay.username || null, password: relay.password || null };
+      b.relay = { id: 'relay', name: p ? p.name : 'Outbound relay', kind: preset === 'cloudflare' ? 'cloudflare' : 'smtp', host: relay.host.trim(), port: Number(relay.port) || 587, tls: relay.tls, username: relay.username || null, password: relay.password || null };
     }
     return b;
   }

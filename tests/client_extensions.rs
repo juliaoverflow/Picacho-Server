@@ -1072,6 +1072,78 @@ async fn caldav_server_scheduling() {
     assert!(body.contains("UID:jmap-meet"), "{body}");
 }
 
+// ------------------------------------------------------------ Cloudflare Email Service
+
+#[tokio::test]
+async fn cloudflare_email_worker_delivers_inbound_mail() {
+    let s = server().await;
+    let c = reqwest::Client::new();
+    let url = format!("http://{}/api/inbound/v1/cloudflare", s.web);
+    let msg = "Authentication-Results: mx.cloudflare.net; dkim=pass header.d=elsewhere.test; spf=pass smtp.mailfrom=elsewhere.test; dmarc=pass\r\nFrom: Cy <cy@elsewhere.test>\r\nTo: bob@example.test\r\nSubject: Via Cloudflare\r\nMessage-ID: <cf-1@elsewhere.test>\r\n\r\nHello\r\n";
+    let post = |secret: &str, to: &str, body: &str| {
+        let ts = chrono::Utc::now().timestamp().to_string();
+        c.post(&url)
+            .header("content-type", "message/rfc822")
+            .header("x-picacho-timestamp", &ts)
+            .header("x-picacho-signature", picacho_server::cloudflare::signature(secret, &ts, body.as_bytes()))
+            .header("x-picacho-from", "cy@elsewhere.test")
+            .header("x-picacho-to", to)
+            .body(body.to_string())
+            .send()
+    };
+    // Off until set up.
+    assert_eq!(post("whatever-secret-123", "bob@example.test", msg).await.unwrap().status(), 404);
+    // As the console sets it up.
+    let mut a = s.state.db.account_by_email("bob@example.test").await.unwrap().unwrap();
+    a.role = "admin".into();
+    s.state.db.update_account(&a).await.unwrap();
+    let (token, h, p) = picacho_server::auth::generate_token();
+    s.state.db.create_token(a.id, "admin", &h, &p, "admin", None).await.unwrap();
+    let r: serde_json::Value = c.post(format!("http://{}/api/admin/cloudflare/worker", s.web)).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    let secret = r["secret"].as_str().unwrap_or_else(|| panic!("{r}")).to_string();
+    assert!(r["worker"].as_str().unwrap().contains("/api/inbound/v1/cloudflare"));
+    assert_ne!(r["settings"]["relay"]["cloudflare_inbound"]["secret"], secret, "shown once, then redacted");
+
+    // Signed: delivered, with a Received line and Cloudflare's results kept.
+    let r = post(&secret, "bob@example.test", msg).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap()["action"], "accept");
+    assert_eq!(inbox_count(&s, "bob@example.test").await, 1);
+    // Wrong secret, stale or tampered: refused, nothing delivered.
+    assert_eq!(post("not-the-secret-at-all", "bob@example.test", msg).await.unwrap().status(), 401);
+    let ts = (chrono::Utc::now().timestamp() - 3600).to_string();
+    let r = c.post(&url).header("x-picacho-timestamp", &ts).header("x-picacho-signature", picacho_server::cloudflare::signature(&secret, &ts, msg.as_bytes()))
+        .header("x-picacho-from", "cy@elsewhere.test").header("x-picacho-to", "bob@example.test").body(msg).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    // Unknown here: the Worker rejects it at Cloudflare. Other domains too (no open relay).
+    for to in ["nobody@example.test", "someone@elsewhere.test"] {
+        let r = post(&secret, to, msg).await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["action"], "reject", "{to}");
+    }
+    assert_eq!(inbox_count(&s, "bob@example.test").await, 1);
+    // A DMARC failure Cloudflare reports goes to Junk (when quarantining).
+    let mut set = (*s.state.settings()).clone();
+    set.security.quarantine_to_junk = true;
+    s.state.save_settings(set).await.unwrap();
+    let failing = msg.replace("dmarc=pass", "dmarc=fail").replace("cf-1@", "cf-2@");
+    assert_eq!(post(&secret, "bob@example.test", &failing).await.unwrap().status(), 200);
+    assert_eq!(inbox_count(&s, "bob@example.test").await, 1, "not in the inbox");
+}
+
+#[test]
+fn cloudflare_transport_settings() {
+    use picacho_server::settings::{LiveSettings, Transport, TransportKind};
+    let mut s = LiveSettings::default();
+    s.delivery.transports.push(Transport { id: "cf".into(), name: "Cloudflare".into(), kind: TransportKind::Cloudflare, ..Default::default() });
+    assert!(s.validate().unwrap_err().contains("API token"));
+    s.delivery.transports[0].password = Some("token".into());
+    assert!(s.validate().is_ok());
+    let json = serde_json::to_value(&s.delivery.transports[0]).unwrap();
+    assert_eq!(json["kind"], "cloudflare");
+    assert_eq!(s.redacted().delivery.transports[0].password.as_deref(), Some(picacho_server::settings::REDACTED));
+}
+
 // ------------------------------------------------------------ POP3
 
 struct Pop {

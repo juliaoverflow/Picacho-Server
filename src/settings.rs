@@ -253,12 +253,23 @@ pub struct RelaySettings {
     pub upstream: Option<UpstreamRelay>,
     /// Upstream side: accept downstream Picacho servers.
     pub accept_downstream: bool,
+    /// Mail Cloudflare Email Routing receives, handed over by an Email Worker.
+    pub cloudflare_inbound: CloudflareInbound,
 }
 
 impl Default for RelaySettings {
     fn default() -> Self {
-        Self { upstream: None, accept_downstream: false }
+        Self { upstream: None, accept_downstream: false, cloudflare_inbound: CloudflareInbound::default() }
     }
+}
+
+/// Receiving through Cloudflare Email Routing and an Email Worker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct CloudflareInbound {
+    pub enabled: bool,
+    /// Shared with the Worker (PICACHO_SECRET); signs each message it posts.
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -743,6 +754,8 @@ pub enum TransportKind {
     Webhook,
     /// Hand off to an upstream Picacho Server server over HTTPS (relay link).
     Picacho,
+    /// Cloudflare Email Service (authenticated SMTP on port 465, API token).
+    Cloudflare,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -824,6 +837,9 @@ impl LiveSettings {
                 u.token = Some(REDACTED.into());
             }
         }
+        if s.relay.cloudflare_inbound.secret.as_deref().is_some_and(|p| !p.is_empty()) {
+            s.relay.cloudflare_inbound.secret = Some(REDACTED.into());
+        }
         for t in &mut s.delivery.transports {
             if t.password.as_deref().is_some_and(|p| !p.is_empty()) {
                 t.password = Some(REDACTED.into());
@@ -854,6 +870,9 @@ impl LiveSettings {
                 u.token = old.relay.upstream.as_ref().and_then(|o| o.token.clone());
             }
         }
+        if self.relay.cloudflare_inbound.secret.as_deref() == Some(REDACTED) {
+            self.relay.cloudflare_inbound.secret = old.relay.cloudflare_inbound.secret.clone();
+        }
         for t in &mut self.delivery.transports {
             let prev = old.delivery.transports.iter().find(|o| o.id == t.id);
             if t.password.as_deref() == Some(REDACTED) {
@@ -878,6 +897,9 @@ impl LiveSettings {
                 TransportKind::Smtp if t.host.trim().is_empty() => {
                     return Err(format!("transport '{}' needs a host", t.id))
                 }
+                TransportKind::Cloudflare if t.password.as_deref().unwrap_or("").trim().is_empty() => {
+                    return Err(format!("transport '{}' needs a Cloudflare API token", t.id))
+                }
                 TransportKind::Webhook => {
                     let url = t.url.as_deref().unwrap_or("");
                     if !(url.starts_with("https://") || url.starts_with("http://")) {
@@ -891,6 +913,10 @@ impl LiveSettings {
             if !ids.contains(&r.transport) {
                 return Err(format!("route '{}' uses unknown transport '{}'", r.pattern, r.transport));
             }
+        }
+        let cf = &self.relay.cloudflare_inbound;
+        if cf.enabled && cf.secret.as_deref().unwrap_or("").len() < 16 {
+            return Err("the Cloudflare Worker secret must be at least 16 characters".into());
         }
         if self.limits.max_message_bytes < 1024 {
             return Err("max message size is too small".into());
