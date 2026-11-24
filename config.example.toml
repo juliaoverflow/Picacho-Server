@@ -115,6 +115,7 @@
 # idle_timeout_secs = 1800
 # auth_timeout_secs = 60
 # shutdown_grace_secs = 30        # on SIGTERM, wait this long for sessions and deliveries
+# imap_progress_ms = 2000         # IMAP INPROGRESS reports on long commands, this often
 
 # [kerberos]
 # Kerberos sign-in (SASL GSSAPI) for IMAP, SMTP, POP3 and ManageSieve.

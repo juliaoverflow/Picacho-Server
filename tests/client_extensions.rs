@@ -21,10 +21,16 @@ pub struct Srv {
 }
 
 pub async fn server() -> Srv {
+    server_with(|_| {}).await
+}
+
+/// A server whose configuration `tweak` adjusts first.
+pub async fn server_with(tweak: impl FnOnce(&mut Config)) -> Srv {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.hostname = Some("mx.example.test".into());
     cfg.storage.data_dir = dir.path().to_path_buf();
+    tweak(&mut cfg);
     let state = AppState::new(cfg).await.unwrap();
     let mut s = (*state.settings()).clone();
     s.server.setup_complete = true;
@@ -148,6 +154,38 @@ async fn imap_object_ids_preview_savedate_appendlimit() {
     // APPENDLIMIT is the server's message size limit.
     let limit: usize = caps.split("APPENDLIMIT=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
     assert_eq!(limit as u64, s.state.settings().limits.max_message_bytes as u64);
+}
+
+#[tokio::test]
+async fn imap_inprogress_reports_on_long_commands() {
+    // Reports start at once with no interval, so a short mailbox shows them.
+    let s = server_with(|c| c.limits.imap_progress_ms = 0).await;
+    let mut c = Imap::login(s.imap, "bob@example.test").await;
+    assert!(c.cmd("CAPABILITY").await.contains(" INPROGRESS"));
+    c.cmd("CREATE Archive").await;
+    for i in 1..=3 {
+        assert!(tagged_ok(&c.append("APPEND INBOX", &msg(&format!("p{i}"), "x")).await));
+    }
+    c.cmd("SELECT INBOX").await;
+    let r = c.cmd("UID SEARCH ALL").await;
+    // The command's tag, from its tagged reply.
+    let tag = r.lines().last().unwrap().split(' ').next().unwrap().to_string();
+    assert!(r.contains(&format!("* OK [INPROGRESS (\"{tag}\" 0 3)]")), "{r}");
+    assert!(r.contains(&format!("* OK [INPROGRESS (\"{tag}\" 2 3)]")), "{r}");
+    let tagged = r.find(&format!("{tag} OK")).unwrap();
+    assert!(r.rfind("INPROGRESS").unwrap() < tagged, "nothing after the tagged reply: {r}");
+    let r = c.cmd("SORT (SUBJECT) UTF-8 ALL").await;
+    assert!(r.contains("[INPROGRESS (") && r.contains("* SORT 1 2 3"), "{r}");
+    let r = c.cmd("UID COPY 1:* Archive").await;
+    assert!(tagged_ok(&r) && r.contains("COPYUID"), "{r}");
+
+    // With the default interval, quick commands say nothing extra.
+    let s = server().await;
+    let mut c = Imap::login(s.imap, "bob@example.test").await;
+    c.append("APPEND INBOX", &msg("q", "x")).await;
+    c.cmd("SELECT INBOX").await;
+    let r = c.cmd("UID SEARCH ALL").await;
+    assert!(!r.contains("INPROGRESS"), "{r}");
 }
 
 #[tokio::test]

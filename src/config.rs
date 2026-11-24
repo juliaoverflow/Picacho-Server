@@ -343,6 +343,9 @@ pub struct Limits {
     pub auth_timeout_secs: u64,
     /// On SIGTERM, wait this long for open sessions and deliveries to finish.
     pub shutdown_grace_secs: u64,
+    /// IMAP commands running longer than this report progress (INPROGRESS,
+    /// RFC 9585) this often, so clients keep waiting.
+    pub imap_progress_ms: u64,
 }
 
 impl Default for Limits {
@@ -355,6 +358,7 @@ impl Default for Limits {
             idle_timeout_secs: 30 * 60,
             auth_timeout_secs: 60,
             shutdown_grace_secs: 30,
+            imap_progress_ms: 2000,
         }
     }
 }

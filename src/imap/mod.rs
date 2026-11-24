@@ -14,6 +14,7 @@ pub mod sort;
 pub mod utf7;
 pub mod notify;
 pub mod urlauth;
+pub mod progress;
 
 use crate::db::{Account, FlagUpdate, Mailbox};
 use crate::net::Stream;
@@ -240,7 +241,7 @@ impl Session {
              CONDSTORE QRESYNC ESEARCH ESORT SORT SORT=DISPLAY THREAD=ORDEREDSUBJECT THREAD=REFERENCES BINARY MULTIAPPEND \
              CATENATE LIST-EXTENDED LIST-STATUS QUOTA QUOTA=RES-STORAGE WITHIN STATUS=SIZE ACL RIGHTS=texk METADATA \
              OBJECTID SAVEDATE PREVIEW REPLACE SEARCHRES UTF8=ACCEPT UIDONLY PARTIAL NOTIFY URLAUTH LIST-MYRIGHTS \
-             METADATA-SERVER MULTISEARCH SEARCH=FUZZY JMAPACCESS",
+             METADATA-SERVER MULTISEARCH SEARCH=FUZZY JMAPACCESS INPROGRESS",
         );
         c.push_str(&format!(" APPENDLIMIT={}", self.state.settings().limits.max_message_bytes));
         if !self.compressed {
@@ -769,6 +770,11 @@ impl Session {
 
     // ------------------------------------------------------------- mailbox
     // ------------------------------------------------------------- mailbox
+
+    /// How often long commands report progress (INPROGRESS).
+    fn progress_every(&self) -> Duration {
+        Duration::from_millis(self.state.config.limits.imap_progress_ms)
+    }
 
     fn account_id(&self) -> i64 {
         self.account.as_ref().map(|a| a.id).unwrap_or(0)
@@ -1548,6 +1554,8 @@ impl Session {
             return Ok(Resp::Bad("[CANNOT] Message numbers aren't allowed here.".into()));
         }
         let needs = key.needs_content();
+        // Across mailboxes the total isn't known up front: NIL counts.
+        let mut ticker = progress::Ticker::new(self.progress_every());
         for mb in targets {
             let rows = self.state.db.messages_by_uids(mb.id, 1, i64::MAX).await?;
             let max_uid = rows.last().map(|r| r.uid).unwrap_or(0);
@@ -1555,6 +1563,10 @@ impl Session {
             let candidates = crate::dbx::fts_candidates(&self.state.db, mb.id, &key).await;
             let mut ids: Vec<(i64, i64)> = vec![];
             for (n, row) in rows.iter().enumerate() {
+                if ticker.due() {
+                    self.conn.push(&progress::line(&self.tag, None, None));
+                    let _ = tokio::time::timeout(self.progress_every(), self.conn.flush()).await;
+                }
                 if candidates.as_ref().is_some_and(|c| !c.contains(&row.uid)) {
                     continue;
                 }
@@ -2015,7 +2027,8 @@ impl Session {
         if uids.is_empty() {
             return Ok(());
         }
-        let (_, blobs, freed) = self.state.db.expunge(mailbox_id, uids).await?;
+        let every = self.progress_every();
+        let (_, blobs, freed) = progress::during(&mut self.conn, &self.tag, every, self.state.db.expunge(mailbox_id, uids)).await?;
         self.state.db.add_usage(account_id, -freed).await?;
         self.state.hub.notify(mailbox_id);
         self.state.blobs.delete_all(&blobs).await;
@@ -2101,7 +2114,14 @@ impl Session {
         let max_msn = sel.view.len() as i64;
         let candidates = crate::dbx::fts_candidates(&self.state.db, sel.mb.id, key).await;
         let mut hits = vec![];
+        let mut ticker = progress::Ticker::new(self.progress_every());
+        let total = sel.view.len();
         for (i, e) in sel.view.iter().enumerate() {
+            if ticker.due() {
+                // `sel` borrows the session, so the connection is reached directly.
+                self.conn.push(&progress::line(&self.tag, Some(i), Some(total)));
+                let _ = tokio::time::timeout(self.progress_every(), self.conn.flush()).await;
+            }
             if candidates.as_ref().is_some_and(|c| !c.contains(&e.uid)) {
                 continue;
             }
@@ -2250,7 +2270,12 @@ impl Session {
     async fn items_for(&mut self, idx: &[usize], rows: &HashMap<i64, crate::db::MessageRow>) -> Vec<sort::Item> {
         let sel = self.sel.as_ref().unwrap();
         let mut out = Vec::with_capacity(idx.len());
-        for &i in idx {
+        let mut ticker = progress::Ticker::new(self.progress_every());
+        for (n, &i) in idx.iter().enumerate() {
+            if ticker.due() {
+                self.conn.push(&progress::line(&self.tag, Some(n), Some(idx.len())));
+                let _ = tokio::time::timeout(self.progress_every(), self.conn.flush()).await;
+            }
             let e = &sel.view[i];
             let Some(row) = rows.get(&e.uid) else { continue };
             let meta = match serde_json::from_str::<crate::mime::Meta>(&row.meta) {
@@ -2730,10 +2755,11 @@ impl Session {
         // Within one account a move keeps each message (and its EMAILID, RFC
         // 8474); into another account's shared mailbox it's a copy and expunge.
         let in_place = mv && src_owner == acc;
+        let every = self.progress_every();
         let pairs = if in_place {
-            self.state.db.move_messages(src_id, &uids, dst.id).await?
+            progress::during(&mut self.conn, &self.tag, every, self.state.db.move_messages(src_id, &uids, dst.id)).await?
         } else {
-            let (pairs, added) = self.state.db.copy_messages(src_id, &uids, dst.id).await?;
+            let (pairs, added) = progress::during(&mut self.conn, &self.tag, every, self.state.db.copy_messages(src_id, &uids, dst.id)).await?;
             self.state.db.add_usage(acc, added).await?;
             pairs
         };
