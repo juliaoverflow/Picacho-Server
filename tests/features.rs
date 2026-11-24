@@ -115,6 +115,46 @@ async fn sieve_fileinto_and_vacation() {
 }
 
 #[tokio::test]
+async fn sieve_special_use_and_vacation_fcc() {
+    let s = server("example.test").await;
+    let bob = s.state.db.account_by_email("bob@example.test").await.unwrap().unwrap();
+    s.state.db.create_mailbox(bob.id, "Starred", "\\Flagged").await.unwrap();
+    // RFC 8579: the folder with the attribute wins over the named one; a
+    // missing attribute falls back to the name. RFC 8580: the reply's copy
+    // goes to Sent.
+    let script = "require [\"fileinto\", \"special-use\", \"vacation\", \"fcc\", \"imap4flags\"];\r\n\
+        if header :contains \"subject\" \"[star]\" { fileinto :specialuse \"\\\\Flagged\" \"Elsewhere\"; stop; }\r\n\
+        if specialuse_exists \"\\\\All\" { discard; stop; }\r\n\
+        if header :contains \"subject\" \"[later]\" { fileinto :specialuse \"\\\\All\" \"Later\"; stop; }\r\n\
+        vacation :days 1 :handle \"picacho-vacation\" :fcc \"Sent\" :flags \"\\\\Seen\" \"I'm away.\";\r\n";
+    picacho_server::sieve::check(script).unwrap();
+    s.state.db.sieve_put(bob.id, "main", script).await.unwrap();
+    s.state.db.sieve_activate(bob.id, Some("main")).await.unwrap();
+
+    let mut c = Smtp::connect(s.smtp).await;
+    c.cmd("EHLO client.test").await;
+    for (n, subject) in [(1, "[star] look"), (2, "[later] read"), (3, "personal")] {
+        let msg = format!("From: alice@elsewhere.test\r\nTo: bob@example.test\r\nSubject: {subject}\r\nMessage-ID: <{n}@x>\r\n\r\nhi");
+        let r = c.send("alice@elsewhere.test", "bob@example.test", &msg).await;
+        assert!(r.starts_with("250"), "{r}");
+    }
+    assert_eq!(folder_count(&s.state, "bob@example.test", "Starred").await, 1);
+    assert_eq!(folder_count(&s.state, "bob@example.test", "Elsewhere").await, 0);
+    assert_eq!(folder_count(&s.state, "bob@example.test", "Later").await, 1);
+    assert_eq!(folder_count(&s.state, "bob@example.test", "INBOX").await, 1);
+    let sent = s.state.db.mailbox(bob.id, "Sent").await.unwrap().unwrap();
+    let copies = s.state.db.view(sent.id).await.unwrap();
+    assert_eq!(copies.len(), 1);
+    assert!(copies[0].flags.contains("\\Seen"), "{}", copies[0].flags);
+    let copy = s.state.db.messages_by_uids(sent.id, copies[0].uid, copies[0].uid).await.unwrap();
+    let text = String::from_utf8_lossy(&s.state.blobs.get(&copy[0].blob).await.unwrap()).to_string();
+    assert!(text.contains("Auto-Submitted: auto-replied") && text.contains("I'm away."), "{text}");
+    let q = s.state.db.list_queue().await.unwrap();
+    let replies: Vec<_> = q.iter().filter(|i| i.sender.is_empty() && i.recipients == vec!["alice@elsewhere.test".to_string()]).collect();
+    assert_eq!(replies.len(), 1, "{q:?}");
+}
+
+#[tokio::test]
 async fn filter_blocks_executables_and_bdat_dsn_work() {
     let s = server("example.test").await;
     let mut c = Smtp::connect(s.smtp).await;

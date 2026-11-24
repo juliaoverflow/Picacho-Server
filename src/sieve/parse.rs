@@ -406,10 +406,17 @@ pub const EXTENSIONS: &[&str] = &[
     "date",
     "index",
     "mailbox",
+    "special-use",
+    "fcc",
     "spamtest",
     "virustest",
     "include",
 ];
+
+/// A special-use attribute (RFC 6154): `\` followed by an IMAP atom.
+pub fn valid_special_use(s: &str) -> bool {
+    s.strip_prefix('\\').is_some_and(|atom| !atom.is_empty() && atom.bytes().all(|b| b.is_ascii_graphic() && !b"(){%*\"\\]".contains(&b)))
+}
 
 pub fn parse(src: &str) -> Result<Script, Error> {
     if src.len() > 1024 * 1024 {
@@ -470,11 +477,34 @@ fn validate(s: &Script, cmds: &[Command]) -> Result<(), Error> {
         if has_tag("copy") {
             need(c, "copy")?;
         }
-        if has_tag("flags") && c.name == "fileinto" {
+        if has_tag("flags") && matches!(c.name.as_str(), "fileinto" | "vacation") {
             need(c, "imap4flags")?;
         }
         if has_tag("create") {
             need(c, "mailbox")?;
+        }
+        // RFC 8580: :fcc keeps a copy of what vacation sends; :create,
+        // :flags and :specialuse then apply to that copy.
+        if has_tag("fcc") {
+            if c.name != "vacation" {
+                return Err(Error { line: c.line, msg: format!("{} has no :fcc", c.name) });
+            }
+            need(c, "fcc")?;
+        } else if c.name == "vacation" && ["create", "flags", "specialuse"].iter().any(|t| has_tag(t)) {
+            return Err(Error { line: c.line, msg: "vacation :create, :flags and :specialuse need :fcc".into() });
+        }
+        // RFC 8579: `fileinto :specialuse "\\Junk" "Junk"`.
+        if has_tag("specialuse") {
+            if !matches!(c.name.as_str(), "fileinto" | "vacation") {
+                return Err(Error { line: c.line, msg: format!("{} has no :specialuse", c.name) });
+            }
+            need(c, "special-use")?;
+            let pos = c.args.iter().position(|a| a == &Arg::Tag("specialuse".into()));
+            match pos.and_then(|p| c.args.get(p + 1)) {
+                Some(Arg::Str(u)) if u.contains("${") || valid_special_use(u) => {}
+                Some(Arg::Str(u)) => return Err(Error { line: c.line, msg: format!("\"{u}\" isn't a special-use attribute") }),
+                _ => return Err(Error { line: c.line, msg: ":specialuse needs a string".into() }),
+            }
         }
         for t in &c.tests {
             validate_test(s, t)?;
@@ -502,6 +532,7 @@ fn validate_test(s: &Script, t: &Test) -> Result<(), Error> {
         "hasflag" => need("imap4flags")?,
         "date" | "currentdate" => need("date")?,
         "mailboxexists" => need("mailbox")?,
+        "specialuse_exists" => need("special-use")?,
         "spamtest" => need("spamtest")?,
         "virustest" => need("virustest")?,
         other => return Err(Error { line: t.line, msg: format!("unknown test \"{other}\"") }),
@@ -562,5 +593,21 @@ comment */
         assert_eq!(s.commands[1].args[0], Arg::Str("I'm away.\r\n.dot\r\n".into()));
         let s = parse("redirect \"a@b.c\"; if size :over 1M { discard; }").unwrap();
         assert_eq!(s.commands[1].tests[0].args[1], Arg::Num(1 << 20));
+    }
+    #[test]
+    fn special_use_and_fcc() {
+        // What the Picacho app writes (sync/sieve.rs).
+        parse("require [\"fileinto\", \"special-use\"];\r\nif header :contains \"subject\" \"x\" { fileinto :specialuse \"\\\\Junk\" \"Junk\"; }\r\n").unwrap();
+        parse("require [\"vacation\", \"fcc\"];\r\nvacation :days 7 :handle \"picacho-vacation\" :from \"a@x.example\" :fcc \"Sent\" :mime \"Away\";\r\n").unwrap();
+        parse("require [\"vacation\", \"fcc\", \"mailbox\", \"imap4flags\", \"special-use\"];\nvacation :fcc \"Sent\" :create :flags \"\\\\Seen\" :specialuse \"\\\\Sent\" \"Away\";").unwrap();
+        parse("require [\"special-use\"];\nif specialuse_exists \"\\\\Junk\" { keep; }\nif specialuse_exists \"Spam\" [\"\\\\Junk\"] { keep; }").unwrap();
+        assert!(parse("require \"fileinto\"; fileinto :specialuse \"\\\\Junk\" \"Junk\";").is_err());
+        assert!(parse("require [\"fileinto\", \"special-use\"]; fileinto :specialuse \"Junk\" \"Junk\";").is_err());
+        assert!(parse("if specialuse_exists \"\\\\Junk\" { keep; }").is_err());
+        assert!(parse("require \"vacation\"; vacation :fcc \"Sent\" \"Away\";").is_err());
+        assert!(parse("require [\"vacation\", \"mailbox\"]; vacation :create \"Away\";").is_err());
+        assert!(parse("require [\"fileinto\", \"fcc\"]; fileinto :fcc \"Sent\" \"x\";").is_err());
+        assert!(parse("require [\"vacation\", \"fcc\"]; vacation :fcc \"Sent\" :flags \"\\\\Seen\" \"Away\";").is_err());
+        assert!(EXTENSIONS.contains(&"fcc") && EXTENSIONS.contains(&"special-use"));
     }
 }

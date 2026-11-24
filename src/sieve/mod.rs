@@ -1,7 +1,7 @@
 //! Sieve mail filtering (RFC 5228) with fileinto, reject, envelope,
 //! imap4flags, body, variables, vacation (+seconds), relational,
-//! subaddress, copy, regex, date, index, mailbox, spamtest/virustest,
-//! include and encoded-character. Scripts are managed with ManageSieve
+//! subaddress, copy, regex, date, index, mailbox, special-use, fcc,
+//! spamtest/virustest, include and encoded-character. Scripts are managed with ManageSieve
 //! (RFC 5804), JMAP (RFC 9661 SieveScript) or the account API.
 pub mod deliver;
 pub mod interp;

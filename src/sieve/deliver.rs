@@ -6,13 +6,50 @@ use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 pub struct Plan {
-    /// (folder, flags) to store the message in.
-    pub stores: Vec<(String, Vec<String>)>,
+    /// Where to store the message.
+    pub stores: Vec<Store>,
     pub redirects: Vec<String>,
     pub reject: Option<String>,
     pub vacation: Option<Vacation>,
     /// Account address the message arrived for (vacation From).
     pub rcpt: String,
+}
+
+#[derive(Debug, Default)]
+pub struct Store {
+    pub folder: String,
+    pub flags: Vec<String>,
+    /// RFC 8579 `:specialuse`: the folder with this attribute, if any,
+    /// instead of `folder`.
+    pub special_use: Option<String>,
+    /// RFC 5490 `:create`.
+    pub create: bool,
+}
+
+impl Store {
+    fn kept(junk: bool, flags: Vec<String>) -> Self {
+        Store { folder: default_folder(junk), flags, ..Default::default() }
+    }
+}
+
+/// The special uses IMAP CREATE accepts (RFC 6154): the only ones a folder
+/// made by `:specialuse ... :create` is given.
+const SPECIAL_USES: [&str; 7] = ["\\All", "\\Archive", "\\Drafts", "\\Flagged", "\\Junk", "\\Sent", "\\Trash"];
+
+/// RFC 8579 §4: the owner's folder with `special_use`, else `folder`. With
+/// `create`, a missing `folder` is made with that special use.
+async fn special_use_folder(state: &State, account_id: i64, folder: &str, special_use: Option<&str>, create: bool) -> anyhow::Result<String> {
+    let Some(special_use) = special_use else { return Ok(folder.to_string()) };
+    let boxes = state.db.list_mailboxes(account_id).await?;
+    if let Some(m) = boxes.iter().find(|m| m.special_use.split_whitespace().any(|u| u.eq_ignore_ascii_case(special_use))) {
+        return Ok(m.name.clone());
+    }
+    if create && !folder.eq_ignore_ascii_case("INBOX") && !boxes.iter().any(|m| m.name == folder) {
+        if let Some(u) = SPECIAL_USES.iter().find(|u| u.eq_ignore_ascii_case(special_use)) {
+            state.db.create_mailbox(account_id, folder, u).await?;
+        }
+    }
+    Ok(folder.to_string())
 }
 
 fn default_folder(junk: bool) -> String {
@@ -67,7 +104,7 @@ pub async fn plan(state: &State, account_id: i64, sender: &str, rcpt: &str, raw:
     let active = state.db.sieve_active(account_id).await.ok().flatten();
     let vac = state.db.vacation(account_id).await.unwrap_or_default();
     let Some(active) = active else {
-        plan.stores.push((default_folder(junk), vec![]));
+        plan.stores.push(Store::kept(junk, vec![]));
         if vac.active_at(crate::util::now()) {
             plan.vacation = Some(jmap_vacation(&vac));
         }
@@ -77,7 +114,7 @@ pub async fn plan(state: &State, account_id: i64, sender: &str, rcpt: &str, raw:
         Ok(s) => s,
         Err(e) => {
             state.event("warn", "sieve", &format!("account {account_id}: script \"{}\" has an error ({e}); keeping message", active.name));
-            plan.stores.push((default_folder(junk), vec![]));
+            plan.stores.push(Store::kept(junk, vec![]));
             return plan;
         }
     };
@@ -90,7 +127,10 @@ pub async fn plan(state: &State, account_id: i64, sender: &str, rcpt: &str, raw:
             }
         }
     }
-    let folders: Vec<String> = state.db.list_mailboxes(account_id).await.unwrap_or_default().into_iter().map(|m| m.name).collect();
+    let mailboxes = state.db.list_mailboxes(account_id).await.unwrap_or_default();
+    let special_uses: Vec<(String, String)> =
+        mailboxes.iter().flat_map(|m| m.special_use.split_whitespace().map(|u| (m.name.clone(), u.to_string()))).collect();
+    let folders: Vec<String> = mailboxes.into_iter().map(|m| m.name).collect();
     let raw_owned = raw.to_vec();
     let hdrs = headers(raw);
     let spam = spamtest(state, &hdrs);
@@ -107,6 +147,7 @@ pub async fn plan(state: &State, account_id: i64, sender: &str, rcpt: &str, raw:
             envelope_from,
             envelope_to,
             folders,
+            special_uses,
             scripts,
             spamtest: spam,
             virustest: virus,
@@ -116,7 +157,7 @@ pub async fn plan(state: &State, account_id: i64, sender: &str, rcpt: &str, raw:
     })
     .await;
     let Ok(outcome) = outcome else {
-        plan.stores.push((default_folder(junk), vec![]));
+        plan.stores.push(Store::kept(junk, vec![]));
         return plan;
     };
     for e in &outcome.errors {
@@ -125,8 +166,8 @@ pub async fn plan(state: &State, account_id: i64, sender: &str, rcpt: &str, raw:
     for a in outcome.actions {
         crate::metrics::SIEVE_ACTIONS.inc();
         match a {
-            Action::FileInto { folder, flags, .. } => plan.stores.push((folder, flags)),
-            Action::Keep { flags } => plan.stores.push((default_folder(junk), flags)),
+            Action::FileInto { folder, flags, create, special_use } => plan.stores.push(Store { folder, flags, special_use, create }),
+            Action::Keep { flags } => plan.stores.push(Store::kept(junk, flags)),
             Action::Redirect { addr } => plan.redirects.push(addr),
             Action::Reject { reason } => plan.reject = Some(reason),
             Action::Discard => {}
@@ -134,7 +175,7 @@ pub async fn plan(state: &State, account_id: i64, sender: &str, rcpt: &str, raw:
         }
     }
     if outcome.keep {
-        plan.stores.push((default_folder(junk), outcome.flags));
+        plan.stores.push(Store::kept(junk, outcome.flags));
     }
     // A JMAP/console vacation reply applies when the script has none.
     if plan.vacation.is_none() && vac.active_at(crate::util::now()) && plan.reject.is_none() {
@@ -151,6 +192,7 @@ fn jmap_vacation(v: &super::VacationSettings) -> Vacation {
         addresses: vec![],
         mime: false,
         handle: "jmap".into(),
+        fcc: None,
         reason: v.text_body.clone().unwrap_or_else(|| v.html_body.as_deref().map(crate::filter::bayes::strip_html).unwrap_or_default()),
     }
 }
@@ -160,11 +202,12 @@ pub async fn execute(state: &State, account_id: i64, sender: &str, raw: &[u8], p
     // Filters have seen the message; what's kept is encrypted to the owner's
     // key when they have one (forwards and replies below use the original).
     let stored = if plan.stores.is_empty() { std::borrow::Cow::Borrowed(raw) } else { crate::encryption::for_storage(state, account_id, raw).await? };
-    for (folder, flags) in &plan.stores {
+    for store in &plan.stores {
+        let folder = special_use_folder(state, account_id, &store.folder, store.special_use.as_deref(), store.create).await?;
         if !seen.insert(folder.to_ascii_lowercase()) {
             continue;
         }
-        crate::smtp::store_in(state, account_id, folder, &stored, &flags.join(" ")).await?;
+        crate::smtp::store_in(state, account_id, &folder, &stored, &store.flags.join(" ")).await?;
     }
     for addr in &plan.redirects {
         let env_from = if sender.is_empty() { String::new() } else { crate::smtp::delivery::srs_forward(state, sender).await };
@@ -271,6 +314,17 @@ async fn vacation_reply(state: &State, account_id: i64, sender: &str, rcpt: &str
     let signed = crate::smtp::delivery::dkim_sign(state, crate::util::domain_of(&acc.email), m.into_bytes()).await;
     crate::queue::send_report(state, sender, &signed).await?;
     state.event("info", "sieve", &format!("vacation reply from {} to {sender}", acc.email));
+    // RFC 8580: a copy of the reply sent; failing to file it doesn't undo
+    // the reply.
+    if let Some(fcc) = &v.fcc {
+        let filed = async {
+            let folder = special_use_folder(state, account_id, &fcc.folder, fcc.special_use.as_deref(), fcc.create).await?;
+            crate::smtp::store_in(state, account_id, &folder, &signed, &fcc.flags.join(" ")).await
+        };
+        if let Err(e) = filed.await {
+            state.event("warn", "sieve", &format!("account {account_id}: vacation :fcc \"{}\": {e:#}", fcc.folder));
+        }
+    }
     Ok(())
 }
 

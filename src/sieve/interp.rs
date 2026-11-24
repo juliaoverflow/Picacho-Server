@@ -6,7 +6,9 @@ use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    FileInto { folder: String, flags: Vec<String>, create: bool },
+    /// `special_use` (RFC 8579): the owner's folder with that attribute
+    /// wins over `folder`, which is the fallback.
+    FileInto { folder: String, flags: Vec<String>, create: bool, special_use: Option<String> },
     Keep { flags: Vec<String> },
     Redirect { addr: String },
     Reject { reason: String },
@@ -23,6 +25,18 @@ pub struct Vacation {
     pub mime: bool,
     pub handle: String,
     pub reason: String,
+    /// RFC 8580 `:fcc`: where a copy of the reply is filed.
+    pub fcc: Option<Fcc>,
+}
+
+/// A folder for a copy of a vacation reply (RFC 8580), with fileinto's
+/// `:create`, `:flags` and `:specialuse`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Fcc {
+    pub folder: String,
+    pub flags: Vec<String>,
+    pub create: bool,
+    pub special_use: Option<String>,
 }
 
 /// What the script can see.
@@ -36,6 +50,8 @@ pub struct Env<'a> {
     pub envelope_to: String,
     /// The account's folders (for mailboxexists).
     pub folders: Vec<String>,
+    /// (folder, special-use attribute) pairs (for specialuse_exists).
+    pub special_uses: Vec<(String, String)>,
     /// Other scripts of the account (for include).
     pub scripts: HashMap<String, Script>,
     /// 0 = not scanned; 1..=10 per RFC 5235.
@@ -596,6 +612,19 @@ impl Run<'_, '_> {
                 let names = self.strs(t.args.first());
                 names.iter().all(|n| self.env.folders.iter().any(|f| f.eq_ignore_ascii_case(n) || (n.eq_ignore_ascii_case("inbox") && f.eq_ignore_ascii_case("inbox"))))
             }
+            "specialuse_exists" => {
+                // RFC 8579 §5: `specialuse_exists [<mailbox>] <attributes>`.
+                let o = opts(&t.args, &[]);
+                let (folder, uses) = if o.positional.len() >= 2 {
+                    (Some(self.str1(o.positional.first())), self.strs(o.positional.get(1)))
+                } else {
+                    (None, self.strs(o.positional.first()))
+                };
+                let has_use = |u: &String| {
+                    self.env.special_uses.iter().any(|(f, a)| a.eq_ignore_ascii_case(u) && folder.as_ref().is_none_or(|n| n == f || (n.eq_ignore_ascii_case("inbox") && f.eq_ignore_ascii_case("inbox"))))
+                };
+                uses.iter().all(has_use)
+            }
             "spamtest" | "virustest" => {
                 let o = opts(&t.args, &[]);
                 let keys = self.strs(o.positional.first());
@@ -715,11 +744,12 @@ impl Run<'_, '_> {
                     self.add_action(Action::Discard)?;
                 }
                 "fileinto" => {
-                    let o = opts(&c.args, &["flags"]);
+                    let o = opts(&c.args, &["flags", "specialuse"]);
                     let folder = self.str1(o.positional.first());
                     let flags = self.explicit_flags(&o);
                     let create = o.tags.iter().any(|t| t == "create");
-                    self.add_action(Action::FileInto { folder, flags, create })?;
+                    let special_use = self.special_use_arg(&o)?;
+                    self.add_action(Action::FileInto { folder, flags, create, special_use })?;
                     if !o.tags.iter().any(|t| t == "copy") {
                         self.cancel_keep = true;
                     }
@@ -793,7 +823,7 @@ impl Run<'_, '_> {
                     self.vars.insert(name, v);
                 }
                 "vacation" => {
-                    let o = opts(&c.args, &["days", "seconds", "subject", "from", "addresses", "handle"]);
+                    let o = opts(&c.args, &["days", "seconds", "subject", "from", "addresses", "handle", "fcc", "flags", "specialuse"]);
                     let num = |k: &str| match o.tag_values.get(k) {
                         Some(Arg::Num(n)) => Some(*n as i64),
                         _ => None,
@@ -802,6 +832,17 @@ impl Run<'_, '_> {
                     let sv = |k: &str| o.tag_values.get(k).map(|a| self.str1(Some(a)));
                     let reason = self.str1(o.positional.first());
                     let handle = sv("handle").unwrap_or_else(|| crate::util::sha256_hex(format!("{reason}{:?}", sv("subject")).as_bytes())[..16].to_string());
+                    // The copy is of the reply, not the incoming message:
+                    // only explicit :flags, not the internal flags variable.
+                    let fcc = match sv("fcc") {
+                        Some(folder) => Some(Fcc {
+                            folder,
+                            flags: o.tag_values.get("flags").map(|a| self.strs(Some(a)).iter().flat_map(|s| s.split_whitespace().map(|x| x.to_string()).collect::<Vec<_>>()).collect()).unwrap_or_default(),
+                            create: o.tags.iter().any(|t| t == "create"),
+                            special_use: self.special_use_arg(&o)?,
+                        }),
+                        None => None,
+                    };
                     self.add_action(Action::Vacation(Vacation {
                         seconds: seconds.clamp(0, 365 * 86400),
                         subject: sv("subject"),
@@ -810,6 +851,7 @@ impl Run<'_, '_> {
                         mime: o.tags.iter().any(|t| t == "mime"),
                         handle,
                         reason,
+                        fcc,
                     }))?;
                 }
                 "include" => {
@@ -846,6 +888,16 @@ impl Run<'_, '_> {
         Ok(())
     }
 
+    /// RFC 8579 `:specialuse`, checked once variables are expanded.
+    fn special_use_arg(&self, o: &Opts) -> Result<Option<String>, String> {
+        let Some(a) = o.tag_values.get("specialuse") else { return Ok(None) };
+        let u = self.str1(Some(a));
+        if !super::parse::valid_special_use(&u) {
+            return Err(format!(":specialuse \"{u}\" isn't a special-use attribute"));
+        }
+        Ok(Some(u))
+    }
+
     fn explicit_flags(&self, o: &Opts) -> Vec<String> {
         match o.tag_values.get("flags") {
             Some(a) => self.strs(Some(a)).iter().flat_map(|s| s.split_whitespace().map(|x| x.to_string()).collect::<Vec<_>>()).collect(),
@@ -873,7 +925,8 @@ mod tests {
             size: raw.len() as u64,
             envelope_from: "alice@example.com".into(),
             envelope_to: "bob+tag@example.org".into(),
-            folders: vec!["INBOX".into(), "Lists".into()],
+            folders: vec!["INBOX".into(), "Lists".into(), "Spam".into()],
+            special_uses: vec![("Spam".into(), "\\Junk".into())],
             scripts: HashMap::new(),
             spamtest: 2,
             virustest: 1,
@@ -894,7 +947,7 @@ if date :value "ge" "date" "year" "2020" { addflag "$Recent2020"; }
         let raw = b"Subject: x\r\n\r\nhello";
         let o = run(&s, &env(raw, "hello"));
         assert!(o.errors.is_empty(), "{:?}", o.errors);
-        assert_eq!(o.actions, vec![Action::FileInto { folder: "Lists/dev".into(), flags: vec![], create: false }]);
+        assert_eq!(o.actions, vec![Action::FileInto { folder: "Lists/dev".into(), flags: vec![], create: false, special_use: None }]);
         assert!(!o.keep);
         assert!(o.flags.contains(&"\\Flagged".to_string()));
         assert!(o.flags.contains(&"$Recent2020".to_string()));
@@ -913,6 +966,28 @@ vacation :days 3 :subject "Away" "I'm away";
         assert_eq!(o.actions.len(), 1);
         let o = run(&s, &env(b"", "nothing special"));
         assert!(matches!(&o.actions[1], Action::Vacation(v) if v.seconds == 3 * 86400 && v.subject.as_deref() == Some("Away")));
+    }
+
+    #[test]
+    fn special_use_and_fcc() {
+        let s = parse(r#"require ["fileinto", "special-use", "vacation", "fcc", "mailbox", "imap4flags"];
+if specialuse_exists "\\Junk" { fileinto :specialuse "\\Junk" "Junk"; }
+if specialuse_exists "Spam" ["\\Junk", "\\Trash"] { discard; }
+if specialuse_exists "Lists" "\\Junk" { discard; }
+vacation :days 1 :fcc "Sent" :create :flags "\\Seen" :specialuse "\\Sent" "Away";
+"#)
+        .unwrap();
+        let o = run(&s, &env(b"", ""));
+        assert!(o.errors.is_empty(), "{:?}", o.errors);
+        assert!(!o.keep);
+        assert_eq!(o.actions[0], Action::FileInto { folder: "Junk".into(), flags: vec![], create: false, special_use: Some("\\Junk".into()) });
+        let Action::Vacation(v) = &o.actions[1] else { panic!("{:?}", o.actions) };
+        assert_eq!(v.fcc, Some(Fcc { folder: "Sent".into(), flags: vec!["\\Seen".into()], create: true, special_use: Some("\\Sent".into()) }));
+        // A :specialuse that isn't an attribute once expanded is a runtime
+        // error: implicit keep.
+        let s = parse("require [\"fileinto\", \"special-use\", \"variables\"]; set \"u\" \"Junk\"; fileinto :specialuse \"${u}\" \"Junk\";").unwrap();
+        let o = run(&s, &env(b"", ""));
+        assert!(o.keep && !o.errors.is_empty());
     }
 
     #[test]
