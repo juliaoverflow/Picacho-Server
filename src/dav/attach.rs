@@ -32,7 +32,7 @@ pub fn touches(path: &str) -> bool {
     is_attachment_path(path)
 }
 
-fn query_param<'a>(query: &'a str, key: &str) -> Option<String> {
+fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         (k == key).then(|| pct_decode(&v.replace('+', " ")))
