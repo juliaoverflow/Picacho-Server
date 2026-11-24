@@ -181,6 +181,7 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
             Some(n) => w.text_el(DAV, "creationdate", &iso_date(n.created_at)),
             None => return false,
         },
+        (DAV, "supportedlock") if node.is_some_and(directory::is_virtual) => w.empty(DAV, "supportedlock"),
         (DAV, "supportedlock") => {
             w.open(DAV, "supportedlock");
             for scope in ["exclusive", "shared"] {
@@ -233,7 +234,7 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
         }
         (DAV, "current-user-privilege-set") => {
             w.open(DAV, "current-user-privilege-set");
-            let privs: &[&str] = if ctx.read_only {
+            let privs: &[&str] = if ctx.read_only || node.is_some_and(directory::is_virtual) {
                 &["read", "read-current-user-privilege-set"]
             } else {
                 &["all", "read", "write", "write-properties", "write-content", "bind", "unbind", "unlock", "read-acl", "read-current-user-privilege-set"]
@@ -284,6 +285,10 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
             w.close(DAV, "supported-report-set");
         }
         (DAV, "sync-token") | (CS, "getctag") => match node {
+            Some(n) if n.collection && directory::is_virtual(n) => {
+                let t = directory::token(n);
+                w.text_el(ns, name, &if name == "sync-token" { t } else { format!("\"{}\"", t.rsplit('/').next().unwrap_or("")) });
+            }
             Some(n) if n.collection => {
                 let t = st.db.dav_sync_token(n.id).await.unwrap_or(0);
                 let v = if name == "sync-token" { format!("http://picacho.mail/ns/sync/{}-{t}", n.id) } else { format!("\"{}-{t}\"", n.id) };
@@ -292,7 +297,7 @@ pub async fn write_prop(ctx: &Ctx, res: &Res, ns: &str, name: &str, w: &mut Writ
             _ => return false,
         },
         (DAV, "quota-available-bytes") | (DAV, "quota-used-bytes") => match node {
-            Some(n) if n.collection => {
+            Some(n) if n.collection && !directory::is_virtual(n) => {
                 let p = st.db.dav_principal_by_id(ctx.principal.id).await.ok().flatten().unwrap_or_else(|| ctx.principal.clone());
                 if name == "quota-used-bytes" {
                     w.text_el(DAV, name, &p.used_bytes.to_string());
@@ -574,7 +579,7 @@ pub async fn resolve(ctx: &Ctx, t: &Target) -> Result<Option<Res>> {
         Target::Principals => Some(Res::Principals),
         Target::Principal(u) => ctx.state.db.dav_principal(u).await?.map(Res::Principal),
         Target::SectionRoot(s) => Some(Res::SectionRoot(s.clone())),
-        Target::Node(_, p) => ctx.state.db.dav_node(ctx.principal.id, p).await?.map(Res::Node),
+        Target::Node(_, p) => directory::lookup(ctx, p).await?.map(Res::Node),
     })
 }
 
@@ -593,11 +598,18 @@ async fn children(ctx: &Ctx, res: &Res, infinite: bool) -> Result<Vec<Res>> {
         }
         Res::Principals => vec![Res::Principal(me)],
         Res::SectionRoot(s) => st.db.dav_node(me.id, s).await?.map(Res::Node).into_iter().collect(),
+        Res::Node(n) if directory::is_virtual(n) => directory::book(ctx).await?.map(|b| b.1).unwrap_or_default().into_iter().map(Res::Node).collect(),
         Res::Node(n) if n.collection => {
             if infinite {
                 st.db.dav_subtree(me.id, &n.path).await?.into_iter().filter(|x| x.path != n.path).take(20_000).map(Res::Node).collect()
             } else {
-                st.db.dav_children(me.id, &n.path).await?.into_iter().map(Res::Node).collect()
+                let mut v: Vec<Res> = st.db.dav_children(me.id, &n.path).await?.into_iter().map(Res::Node).collect();
+                if n.kind == "addressbook-home" {
+                    if let Some((b, _)) = directory::book(ctx).await? {
+                        v.push(Res::Node(b));
+                    }
+                }
+                v
             }
         }
         _ => vec![],

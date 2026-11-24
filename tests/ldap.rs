@@ -29,6 +29,9 @@ fn directory() -> Arc<Vec<Entry>> {
                 ("mail", vec!["sam@example.test"]),
                 ("cn", vec!["Sam Doe"]),
                 ("memberOf", vec!["cn=mail-admins,ou=groups,dc=test"]),
+                ("telephoneNumber", vec!["+1 520 555 0150"]),
+                ("mobile", vec!["+1 520 555 0151"]),
+                ("title", vec!["Postmaster"]),
             ],
         },
         Entry { dn: "uid=bob,ou=people,dc=test", password: "bob-dir-pw", attrs: vec![("uid", vec!["bob"]), ("mail", vec!["bob@example.test"])] },
@@ -293,6 +296,51 @@ async fn console_sign_in_with_directory() {
     .await;
     assert_eq!(web_login(&s, "root@example.test", "Correct-Horse-9").await.0, 401);
     assert_eq!(web_login(&s, "bob", "bob-dir-pw").await.0, 200);
+}
+
+#[tokio::test]
+async fn directory_groups_and_details_sync() {
+    use picacho_server::settings::{DirectoryRule, ProfileClaim};
+    let url = start_directory().await;
+    let s = start().await;
+    set_ldap(&s, |x| {
+        x.auth.ldap = ldap_cfg(&url);
+        x.auth.ldap.auto_create_accounts = true;
+        x.auth.ldap.group_base_dn = "ou=groups,dc=test".into();
+        x.auth.ldap.profile_attributes = [("phone", "telephoneNumber"), ("phone", "mobile"), ("title", "title")]
+            .iter()
+            .map(|(f, a)| ProfileClaim { field: f.to_string(), claim: a.to_string() })
+            .collect();
+    })
+    .await;
+    assert_eq!(web_login(&s, "sam", "sam-pw").await.0, 200);
+    let sam = s.state.db.account_by_email("sam@example.test").await.unwrap().unwrap();
+    let groups = s.state.db.account_group_sources(sam.id).await.unwrap();
+    assert!(groups.contains(&("cn=mail-admins,ou=groups,dc=test".to_string(), "ldap".to_string())), "{groups:?}");
+    assert!(groups.contains(&("staff".to_string(), "ldap".to_string())), "{groups:?}");
+    let p = s.state.db.account_profile(sam.id).await.unwrap();
+    assert_eq!(p["phone"], vec!["+1 520 555 0150".to_string(), "+1 520 555 0151".to_string()]);
+    assert_eq!(p["title"], vec!["Postmaster".to_string()]);
+
+    // Bob has no groups in the directory; a rule naming the DN's group by name matches Sam.
+    assert_eq!(web_login(&s, "bob", "bob-dir-pw").await.0, 200);
+    let bob = s.state.db.account_by_email("bob@example.test").await.unwrap().unwrap();
+    assert!(s.state.db.account_groups(bob.id).await.unwrap().is_empty());
+    s.state.db.set_account_groups(bob.id, "manual", &["Staff".into()]).await.unwrap();
+    set_ldap(&s, |x| {
+        x.directory.enabled = true;
+        x.directory.rules = vec![DirectoryRule { viewers: vec!["staff".into()], members: vec!["mail-admins".into()], fields: vec!["name".into(), "phone".into()] }];
+    })
+    .await;
+    let entries = picacho_server::directory::load_entries(&s.state).await.unwrap();
+    let me = entries.iter().find(|e| e.id == bob.id).unwrap();
+    let seen = picacho_server::directory::visible(me, &entries, &s.state.settings().directory);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0.id, sam.id);
+    assert!(seen[0].1.contains("phone") && !seen[0].1.contains("title"));
+    // A later sign-in that no longer reports the manual group keeps it.
+    assert_eq!(web_login(&s, "bob", "bob-dir-pw").await.0, 200);
+    assert_eq!(s.state.db.account_groups(bob.id).await.unwrap(), vec!["Staff".to_string()]);
 }
 
 #[tokio::test]

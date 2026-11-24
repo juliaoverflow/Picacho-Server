@@ -20,6 +20,44 @@ pub struct LiveSettings {
     pub retention: RetentionSettings,
     pub relay: RelaySettings,
     pub dav: DavSettings,
+    pub directory: DirectorySettings,
+}
+
+/// The contact directory: a read-only address book (`addressbooks/<me>/directory/`)
+/// listing the people each user may see, decided by group rules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct DirectorySettings {
+    pub enabled: bool,
+    /// Members of these groups see everyone with every field (administrators always do).
+    pub full_access_groups: Vec<String>,
+    pub rules: Vec<DirectoryRule>,
+}
+
+/// Members of `viewers` see the members of `members` ("*" = everyone), with `fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct DirectoryRule {
+    pub viewers: Vec<String>,
+    pub members: Vec<String>,
+    pub fields: Vec<String>,
+}
+
+/// A contact field filled from an identity-provider claim (or LDAP attribute).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ProfileClaim {
+    /// One of `crate::directory::PROFILE_FIELDS`.
+    pub field: String,
+    /// Claim name; dotted paths reach into objects ("attributes.title").
+    pub claim: String,
+}
+
+fn default_profile_claims() -> Vec<ProfileClaim> {
+    [("phone", "phone_number"), ("given_name", "given_name"), ("family_name", "family_name"), ("nickname", "nickname"), ("photo", "picture"), ("address", "address"), ("website", "website"), ("birthday", "birthdate")]
+        .iter()
+        .map(|(f, c)| ProfileClaim { field: f.to_string(), claim: c.to_string() })
+        .collect()
 }
 
 /// Inbound content filtering: built-in scoring, Bayes, rspamd, ClamAV and
@@ -342,6 +380,8 @@ pub struct LdapSettings {
     pub admin_groups: Vec<String>,
     /// Only members of these groups may sign in (empty: anyone found).
     pub required_groups: Vec<String>,
+    /// Contact details read from directory attributes (claim = attribute name).
+    pub profile_attributes: Vec<ProfileClaim>,
     /// Create the mailbox on first sign-in when its address is on a local domain.
     pub auto_create_accounts: bool,
     /// Accept directory passwords in the web console.
@@ -373,6 +413,7 @@ impl Default for LdapSettings {
             group_name_attr: "cn".into(),
             admin_groups: vec![],
             required_groups: vec![],
+            profile_attributes: vec![],
             auto_create_accounts: false,
             web_login: true,
             mail_login: true,
@@ -452,6 +493,12 @@ pub struct OidcSettings {
     pub groups_claim: String,
     /// Members of these groups are administrators (empty: roles aren't synced).
     pub admin_groups: Vec<String>,
+    /// Contact details (phone, title, ...) read from claims at every sign-in.
+    pub profile_claims: Vec<ProfileClaim>,
+    /// Access tokens issued to these client IDs (`client_id`/`azp`) carry the
+    /// full groups claim, so an empty one there clears groups. Tokens for other
+    /// apps only ever add groups and details.
+    pub token_groups_clients: Vec<String>,
     /// Only these email domains may sign in (empty: any).
     pub allowed_domains: Vec<String>,
     /// Create an account on first sign-in when the email is on a local domain.
@@ -479,6 +526,8 @@ impl Default for OidcSettings {
             email_claim: "email".into(),
             groups_claim: "groups".into(),
             admin_groups: vec![],
+            profile_claims: default_profile_claims(),
+            token_groups_clients: vec![],
             allowed_domains: vec![],
             auto_create_accounts: false,
             require_verified_email: true,
@@ -857,6 +906,22 @@ impl LiveSettings {
         }
         if self.auth.ldap.enabled {
             self.auth.ldap.validate()?;
+        }
+        for m in o.profile_claims.iter().chain(&self.auth.ldap.profile_attributes) {
+            if !crate::directory::PROFILE_FIELDS.contains(&m.field.as_str()) {
+                return Err(format!("'{}' isn't a contact field.", m.field));
+            }
+            if m.claim.trim().is_empty() {
+                return Err(format!("Enter the claim or attribute for {}.", m.field));
+            }
+        }
+        for r in &self.directory.rules {
+            if r.viewers.iter().all(|g| g.trim().is_empty()) || r.members.iter().all(|g| g.trim().is_empty()) {
+                return Err("Each directory rule needs viewer and member groups.".into());
+            }
+            if let Some(f) = r.fields.iter().find(|f| !crate::directory::is_field(f)) {
+                return Err(format!("'{f}' isn't a directory field."));
+            }
         }
         if !self.auth.web_password_login && !o.enabled && !self.auth.ldap_web() {
             return Err("Turn on single sign-on or directory sign-in before turning off password sign-in.".into());

@@ -523,6 +523,28 @@ async fn download(
 struct EventQuery {
     ping: Option<u64>,
     closeafter: Option<String>,
+    /// Comma-separated type names, or "*" (RFC 8620 7.3).
+    types: Option<String>,
+}
+
+/// Every type a StateChange can name.
+const PUSH_TYPES: &[&str] = &["Email", "Mailbox", "Thread", "EmailDelivery", "EmailSubmission", "Identity", "Calendar", "CalendarEvent", "AddressBook", "ContactCard"];
+
+/// The StateChange `changed` map for one account. Contacts states carry the
+/// directory's (see jmap/dav.rs); `wanted` limits the types (None: all).
+pub(crate) fn push_types(st: i64, dir: Option<i64>, wanted: Option<&[String]>) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    for t in PUSH_TYPES {
+        if wanted.is_some_and(|w| !w.iter().any(|x| x == t)) {
+            continue;
+        }
+        let v = match (dir, *t) {
+            (Some(d), "AddressBook" | "ContactCard") => format!("{st}.{d}"),
+            _ => st.to_string(),
+        };
+        m.insert(t.to_string(), json!(v));
+    }
+    m
 }
 
 async fn eventsource(
@@ -537,18 +559,24 @@ async fn eventsource(
     };
     let ping = q.ping.filter(|p| *p > 0).map(|p| p.clamp(5, 300));
     let close_after_state = q.closeafter.as_deref() == Some("state");
+    let wanted: Option<Vec<String>> = q.types.as_deref().map(str::trim).filter(|t| !t.is_empty() && *t != "*").map(|t| t.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect());
     let start = state.db.jmap_state(a.id).await.unwrap_or(0);
+    let wants_contacts = wanted.as_ref().is_none_or(|w| w.iter().any(|t| t == "AddressBook" || t == "ContactCard"));
+    let dir_start = if wants_contacts && state.settings().directory.enabled && crate::directory::refresh(&state, &a).await.is_ok() { state.db.directory_state(a.id).await.ok() } else { None };
     struct S {
         state: State,
-        account: i64,
+        account: crate::db::Account,
         last: i64,
+        dir: Option<i64>,
+        wanted: Option<Vec<String>>,
+        wants_contacts: bool,
         ticks: u64,
         ping: Option<u64>,
         done: bool,
         close_after_state: bool,
         first: bool,
     }
-    let init = S { state, account: a.id, last: start, ticks: 0, ping, done: false, close_after_state, first: true };
+    let init = S { state, account: a, last: start, dir: dir_start, wanted, wants_contacts, ticks: 0, ping, done: false, close_after_state, first: true };
     let stream = futures::stream::unfold(init, |mut s| async move {
         if s.done {
             return None;
@@ -560,12 +588,24 @@ async fn eventsource(
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             s.ticks += 1;
-            let now = s.state.db.jmap_state(s.account).await.unwrap_or(s.last);
-            if now != s.last {
+            let now = s.state.db.jmap_state(s.account.id).await.unwrap_or(s.last);
+            // The directory changes when other people do; look every few seconds.
+            let mut dir = s.dir;
+            if s.wants_contacts && s.state.settings().directory.enabled && s.ticks.is_multiple_of(5) && crate::directory::refresh(&s.state, &s.account).await.is_ok() {
+                dir = s.state.db.directory_state(s.account.id).await.ok();
+            }
+            if !s.state.settings().directory.enabled {
+                dir = None;
+            }
+            if now != s.last || dir != s.dir {
                 s.last = now;
-                let acc = format!("a{}", s.account);
-                let st = now.to_string();
-                let ev = json!({"@type": "StateChange", "changed": {acc: {"Email": st, "Mailbox": st, "Thread": st, "EmailDelivery": st}}});
+                s.dir = dir;
+                let acc = account_id(&s.account);
+                let changed = push_types(now, dir, s.wanted.as_deref());
+                if changed.is_empty() {
+                    continue;
+                }
+                let ev = json!({"@type": "StateChange", "changed": {acc: changed}});
                 if s.close_after_state {
                     s.done = true;
                 }

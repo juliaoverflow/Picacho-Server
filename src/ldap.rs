@@ -30,6 +30,9 @@ pub struct DirUser {
     pub emails: Vec<String>,
     pub name: Option<String>,
     pub groups: Vec<String>,
+    /// Contact details from `profile_attributes` (field -> values; empty: the attribute is unset).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub details: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -165,7 +168,12 @@ fn user_attrs(cfg: &LdapSettings) -> Vec<String> {
     if !cfg.group_attr.trim().is_empty() {
         a.push(cfg.group_attr.trim().to_string());
     }
+    for m in &cfg.profile_attributes {
+        a.push(m.claim.trim().to_string());
+    }
     a.retain(|x| !x.is_empty());
+    a.sort();
+    a.dedup();
     a
 }
 
@@ -213,6 +221,26 @@ fn dir_user(cfg: &LdapSettings, e: &SearchEntry, groups: Vec<String>) -> DirUser
         emails: attr(e, cfg.email_attr.trim()).into_iter().map(|m| m.trim().to_ascii_lowercase()).filter(|m| m.contains('@')).collect(),
         name,
         groups,
+        details: cfg
+            .profile_attributes
+            .iter()
+            .filter(|m| crate::directory::PROFILE_FIELDS.contains(&m.field.trim()) && !m.claim.trim().is_empty())
+            .map(|m| {
+                let mut v: Vec<String> = attr(e, m.claim.trim()).into_iter().map(|x| x.trim().chars().take(1000).collect::<String>()).filter(|x| !x.is_empty()).collect();
+                v.dedup();
+                v.truncate(20);
+                (m.field.trim().to_string(), v)
+            })
+            .fold(std::collections::BTreeMap::new(), |mut m, (k, v)| {
+                // Several attributes for one field (telephoneNumber, mobile) add up.
+                let e: &mut Vec<String> = m.entry(k).or_default();
+                for x in v {
+                    if !e.contains(&x) {
+                        e.push(x);
+                    }
+                }
+                m
+            }),
     }
 }
 
@@ -387,6 +415,11 @@ pub async fn resolve_account(state: &State, cfg: &LdapSettings, typed: &str, u: 
             db.update_account(&a).await.map_err(internal)?;
         }
     }
+    // Groups are only known when the directory is set up to report them;
+    // LDAP returns no attribute when it's unset, so an empty value clears.
+    let has_groups = !cfg.group_attr.trim().is_empty() || !cfg.group_base_dn.trim().is_empty();
+    let details = u.details.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+    crate::directory::sync(state, a.id, "ldap", has_groups.then_some(u.groups.as_slice()), &details).await;
     Ok(a)
 }
 
@@ -432,7 +465,7 @@ mod tests {
 
     #[test]
     fn address_choice() {
-        let u = DirUser { dn: "x".into(), emails: vec!["sam@a.test".into(), "s@b.test".into()], name: None, groups: vec![] };
+        let u = DirUser { dn: "x".into(), emails: vec!["sam@a.test".into(), "s@b.test".into()], name: None, groups: vec![], details: Default::default() };
         assert_eq!(mailbox_address("sam", &u).as_deref(), Some("sam@a.test"));
         assert_eq!(mailbox_address("S@B.test", &u).as_deref(), Some("s@b.test"));
         assert_eq!(mailbox_address("other@a.test", &u), None);

@@ -6,12 +6,13 @@
   import Toggle from '../lib/Toggle.svelte';
   import Copy from '../lib/Copy.svelte';
   import SaveBar from '../lib/SaveBar.svelte';
+  import ProfileMap from '../lib/ProfileMap.svelte';
 
   const s = liveSettings();
   const auth = $derived(s.data?.auth);
   const redirectUri = ui.status?.auth?.redirect_uri ?? `${location.origin}/api/auth/oidc/callback`;
   const metadataUrl = `${location.origin}/.well-known/oauth-protected-resource`;
-  let lists = $state({ admin_groups: '', allowed_domains: '', ldap_admin_groups: '', ldap_required_groups: '' });
+  let lists = $state({ admin_groups: '', allowed_domains: '', ldap_admin_groups: '', ldap_required_groups: '', token_groups_clients: '' });
   let testResult = $state(null);
   let testing = $state(false);
   let ldapMode = $state('search');
@@ -23,7 +24,8 @@
         admin_groups: auth.oidc.admin_groups.join(', '),
         allowed_domains: auth.oidc.allowed_domains.join(', '),
         ldap_admin_groups: auth.ldap.admin_groups.join(', '),
-        ldap_required_groups: auth.ldap.required_groups.join(', ')
+        ldap_required_groups: auth.ldap.required_groups.join(', '),
+        token_groups_clients: (auth.oidc.token_groups_clients ?? []).join(', ')
       };
       ldapMode = auth.ldap.user_dn_template ? 'direct' : 'search';
     }
@@ -111,6 +113,11 @@
           <label class="field"><span>Administrator groups</span><input class="input" bind:value={lists.admin_groups} onchange={() => (auth.oidc.admin_groups = split(lists.admin_groups))} placeholder="mail-admins" /><span class="hint">Members become admins, others users. Empty: roles are managed here.</span></label>
           <label class="field"><span>Allowed email domains</span><input class="input" bind:value={lists.allowed_domains} onchange={() => (auth.oidc.allowed_domains = split(lists.allowed_domains))} placeholder="Any" /></label>
         </div>
+        <details class="more">
+          <summary>Contact details for the directory</summary>
+          <p class="hint">Read at every sign-in (from the ID token, or the userinfo endpoint when it's not there) and shown in the contact directory as its rules allow. Dotted names reach into objects, like <code>attributes.title</code>. With Authentik, custom claims need a scope mapping (for example returning <code>{'{"phone": request.user.attributes.get("phone")}'}</code>) added to the provider and its scope listed above. Groups from the groups claim are kept too.</p>
+          <ProfileMap bind:map={auth.oidc.profile_claims} placeholder="phone_number" />
+        </details>
         <Toggle bind:checked={auth.oidc.auto_create_accounts} label="Create mailboxes on first sign-in" hint="For people whose email is on one of your local domains. Otherwise an admin creates the account first." />
         <Toggle bind:checked={auth.oidc.require_verified_email} label="Require a verified email" />
         <div class="row" style="margin-top:8px"><button class="btn small" onclick={test} disabled={testing || !auth.oidc.issuer}><Icon name="zap" size={15} /> {testing ? 'Checking…' : 'Check provider'}</button></div>
@@ -179,6 +186,11 @@
           <label class="field"><span>Administrator groups</span><input class="input" bind:value={lists.ldap_admin_groups} onchange={() => (auth.ldap.admin_groups = split(lists.ldap_admin_groups))} placeholder="mail-admins" /><span class="hint">Group names or DNs. Members become admins, others users. Empty: roles are managed here.</span></label>
           <label class="field"><span>Required groups</span><input class="input" bind:value={lists.ldap_required_groups} onchange={() => (auth.ldap.required_groups = split(lists.ldap_required_groups))} placeholder="Anyone in the directory" /></label>
         </div>
+        <details class="more">
+          <summary>Contact details for the directory</summary>
+          <p class="hint">Attributes read at every directory sign-in and shown in the contact directory as its rules allow. Map a field more than once (telephoneNumber and mobile) to collect both.</p>
+          <ProfileMap bind:map={auth.ldap.profile_attributes} kind="attribute" placeholder="telephoneNumber" />
+        </details>
         <Toggle bind:checked={auth.ldap.auto_create_accounts} label="Create mailboxes on first sign-in" hint="When the directory address is on one of your local domains. Otherwise an admin creates the account first." />
         <Toggle bind:checked={auth.ldap.web_login} label="Use for the web console" />
         <Toggle bind:checked={auth.ldap.mail_login} label="Use for mail, calendar and contacts apps" hint="IMAP, SMTP, JMAP, CalDAV, CardDAV and ManageSieve." />
@@ -230,6 +242,7 @@
       {#if auth.oidc.access_tokens}
         <div class="grid2">
           <label class="field"><span>Resource identifier</span><input class="input mono" bind:value={auth.oidc.resource} placeholder={location.origin} /><span class="hint">Register the same URL as a resource at the provider. Tokens carry it in <code>aud</code>.</span></label>
+          <label class="field"><span>Apps whose tokens carry all groups</span><input class="input mono" bind:value={lists.token_groups_clients} onchange={() => (auth.oidc.token_groups_clients = split(lists.token_groups_clients))} placeholder="Client IDs" /><span class="hint">For the contact directory. Tokens from these apps replace a person's groups and can clear contact details, like a sign-in. Other apps' tokens only add groups and details, because they may carry a filtered groups claim.</span></label>
           <div class="field"><span>What each scope allows</span>
             <ul class="scopes small">
               <li><code>mail.read</code> read-only IMAP and JMAP; with <code>mail.labels</code> and <code>mail.compose</code>, full access</li>

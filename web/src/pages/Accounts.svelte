@@ -13,6 +13,7 @@
   import SieveEditor from '../lib/SieveEditor.svelte';
   import VacationEditor from '../lib/VacationEditor.svelte';
   import DataTools from '../lib/DataTools.svelte';
+  import DirectoryCard from '../lib/DirectoryCard.svelte';
 
   let { onChanged } = $props();
   let accounts = $state([]);
@@ -284,6 +285,8 @@
               <p class="sub" style="margin:4px 0 0">Not set up yet. It is created the first time the account signs in to a calendar or contacts app, if mail accounts get DAV automatically.</p>
             {/if}
           </div>
+
+          <DirectoryCard id={detail.id} />
 
           <div class="card">
             <h3>Backup &amp; migration</h3>

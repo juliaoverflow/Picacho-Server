@@ -22,9 +22,9 @@ pub async fn report(ctx: &Ctx, t: &Target, h: &HeaderMap, body: &[u8]) -> Result
         (CALDAV, "free-busy-query") => free_busy(ctx, t, &doc).await,
         (DAV, "sync-collection") => sync(ctx, t, &doc).await,
         (DAV, "expand-property") => expand_property(ctx, t, &doc).await,
-        (DAV, "principal-property-search") => principal_search(ctx, &doc).await,
+        (DAV, "principal-property-search") => principal_search(ctx, &doc, true).await,
         (DAV, "principal-search-property-set") => Ok(search_property_set()),
-        (DAV, "principal-match") => principal_search(ctx, &doc).await,
+        (DAV, "principal-match") => principal_search(ctx, &doc, false).await,
         _ => Ok(precondition(StatusCode::FORBIDDEN, DAV, "supported-report")),
     }
 }
@@ -46,17 +46,22 @@ fn want_of(doc: &Element) -> Want {
 /// resource) or the members of the target collection.
 async fn members(ctx: &Ctx, t: &Target, depth: &str) -> Result<Option<(Node, Vec<Node>)>> {
     let Target::Node(_, path) = t else { return Ok(None) };
-    let Some(n) = ctx.state.db.dav_node(ctx.principal.id, path).await? else { return Ok(None) };
+    let Some(n) = super::directory::lookup(ctx, path).await? else { return Ok(None) };
     if !n.collection {
         return Ok(Some((n.clone(), vec![n])));
     }
     let kids = if depth == "0" {
         vec![]
+    } else if super::directory::is_virtual(&n) {
+        super::directory::book(ctx).await?.map(|b| b.1).unwrap_or_default()
     } else if n.is_home() {
         // A query on a home covers the objects in all its collections.
         let mut v = vec![];
         for c in ctx.state.db.dav_children(ctx.principal.id, &n.path).await?.into_iter().filter(|c| c.collection) {
             v.extend(ctx.state.db.dav_children(ctx.principal.id, &c.path).await?.into_iter().filter(|x| !x.collection));
+        }
+        if n.kind == "addressbook-home" {
+            v.extend(super::directory::book(ctx).await?.map(|b| b.1).unwrap_or_default());
         }
         v
     } else {
@@ -164,9 +169,20 @@ async fn query(ctx: &Ctx, t: &Target, doc: &Element, depth: &str, calendar: bool
 async fn multiget(ctx: &Ctx, doc: &Element) -> Result<Response> {
     let want = want_of(doc);
     let mut w = multistatus();
+    // Build the directory book once, not per href.
+    let mut book: Option<Option<Vec<Node>>> = None;
     for href in doc.children_named(DAV, "href") {
         let h = href.text();
         let found = match target(h.trim()) {
+            Some(Target::Node(u, p)) if u == ctx.principal.username && super::directory::is_dir_path(&p) => {
+                if book.is_none() {
+                    book = Some(super::directory::book(ctx).await?.map(|b| b.1));
+                }
+                match book.as_ref().and_then(|b| b.as_ref()) {
+                    Some(cards) => cards.iter().find(|c| c.path == p).cloned(),
+                    None => ctx.state.db.dav_node(ctx.principal.id, &p).await?,
+                }
+            }
             Some(Target::Node(u, p)) if u == ctx.principal.username => ctx.state.db.dav_node(ctx.principal.id, &p).await?,
             _ => None,
         };
@@ -234,6 +250,12 @@ fn token_number(tok: &str, coll: i64) -> Option<i64> {
 
 async fn sync(ctx: &Ctx, t: &Target, doc: &Element) -> Result<Response> {
     let Target::Node(user, path) = t else { return Ok(precondition(StatusCode::FORBIDDEN, DAV, "supported-report")) };
+    if super::directory::is_dir_path(path) && super::directory::active(ctx).await? {
+        if path != super::directory::PATH {
+            return Ok(precondition(StatusCode::FORBIDDEN, DAV, "supported-report"));
+        }
+        return super::directory::sync(ctx, doc, &want_of(doc)).await;
+    }
     let Some(coll) = ctx.state.db.dav_node(ctx.principal.id, path).await? else { return Ok(empty(StatusCode::NOT_FOUND)) };
     if !coll.collection {
         return Ok(precondition(StatusCode::FORBIDDEN, DAV, "supported-report"));
@@ -309,14 +331,22 @@ async fn expand_property(ctx: &Ctx, t: &Target, doc: &Element) -> Result<Respons
     Ok(xml_response(StatusCode::MULTI_STATUS, w.finish()))
 }
 
-async fn principal_search(ctx: &Ctx, doc: &Element) -> Result<Response> {
+async fn principal_search(ctx: &Ctx, doc: &Element, directory: bool) -> Result<Response> {
     let me = ctx.principal.clone();
     let needles: Vec<String> = doc.children_named(DAV, "property-search").map(|s| s.child(DAV, "match").map(|m| m.text().to_lowercase()).unwrap_or_default()).collect();
     let hay = format!("{} {} {}", me.username, me.display_name, me.email).to_lowercase();
     let hit = needles.is_empty() || needles.iter().any(|n| hay.contains(n.trim_start_matches("mailto:")));
     let mut w = multistatus();
+    let want = want_of(doc);
     if hit {
-        response(ctx, &Res::Principal(me), &want_of(doc), &mut w).await;
+        response(ctx, &Res::Principal(me), &want, &mut w).await;
+    }
+    // People the contact directory lets this user see (not for principal-match,
+    // which is about the current user).
+    if directory {
+        for p in super::directory::search(ctx, &needles).await? {
+            response(ctx, &Res::Principal(p), &want, &mut w).await;
+        }
     }
     w.close(DAV, "multistatus");
     Ok(xml_response(StatusCode::MULTI_STATUS, w.finish()))

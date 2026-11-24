@@ -83,6 +83,18 @@ fn tables(kind: &DatabaseKind) -> Vec<String> {
         s("CREATE TABLE IF NOT EXISTS dav_locks (token TEXT PRIMARY KEY, principal_id {int} NOT NULL, path TEXT NOT NULL,
             depth TEXT NOT NULL, exclusive {int} NOT NULL, owner TEXT NOT NULL DEFAULT '', expires_at {int} NOT NULL)"),
         s("CREATE INDEX IF NOT EXISTS dav_locks_path ON dav_locks (principal_id, path)"),
+        // ---- contact directory: groups per source, contact details from claims
+        s("CREATE TABLE IF NOT EXISTS account_groups (account_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, source TEXT NOT NULL, PRIMARY KEY (account_id, name, source))"),
+        s("CREATE TABLE IF NOT EXISTS account_profiles (account_id {int} PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            data TEXT NOT NULL DEFAULT '{}', updated_at {int} NOT NULL)"),
+        // What each viewer's directory book last held, and the changes since
+        // (sync tokens for CardDAV, change states for JMAP).
+        s("CREATE TABLE IF NOT EXISTS directory_seen (viewer_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            person_id {int} NOT NULL, etag TEXT NOT NULL, PRIMARY KEY (viewer_id, person_id))"),
+        s("CREATE TABLE IF NOT EXISTS directory_changes (id {id}, viewer_id {int} NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            person_id {int} NOT NULL, deleted {int} NOT NULL DEFAULT 0, ts {int} NOT NULL)"),
+        s("CREATE INDEX IF NOT EXISTS directory_changes_viewer ON directory_changes (viewer_id, id)"),
         // ---- orphaned-object sweep bookmark
         s("CREATE TABLE IF NOT EXISTS gc_seen (key TEXT PRIMARY KEY, first_seen {int} NOT NULL)"),
     ]
@@ -109,6 +121,8 @@ pub async fn migrate(db: &Db, full_text: bool) -> Result<()> {
     let _ = sqlx::query("ALTER TABLE accounts ADD COLUMN prefs TEXT NOT NULL DEFAULT '{}'").execute(&db.pool).await;
     // Mailboxes: per-folder retention override (days, 0 = server default).
     let _ = sqlx::query(&format!("ALTER TABLE mailboxes ADD COLUMN retention_days {int} NOT NULL DEFAULT 0")).execute(&db.pool).await;
+    // Directory changes: the change that made the person visible (created vs updated in JMAP).
+    let _ = sqlx::query(&format!("ALTER TABLE directory_changes ADD COLUMN added {int} NOT NULL DEFAULT 0")).execute(&db.pool).await;
     // Uploads: when the blob was created (sweep).
     let _ = sqlx::query(&format!("ALTER TABLE blob_refs ADD COLUMN created_at {int} NOT NULL DEFAULT 0")).execute(&db.pool).await;
     if full_text {

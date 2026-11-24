@@ -14,6 +14,29 @@
 
   const s = liveSettings();
   const dav = $derived(s.data?.dav);
+  const dir = $derived(s.data?.directory);
+  const FIELDS = [['name', 'Name'], ['email', 'Email'], ['aliases', 'Aliases'], ['groups', 'Groups'], ['phone', 'Phone'], ['given_name', 'Given name'], ['family_name', 'Family name'], ['nickname', 'Nickname'], ['photo', 'Photo'], ['address', 'Address'], ['website', 'Website'], ['birthday', 'Birthday'], ['organization', 'Organization'], ['title', 'Title'], ['department', 'Department']];
+  const list = (v) => (v ?? []).join(', ');
+  const parse = (t) => t.split(',').map((x) => x.trim()).filter(Boolean);
+  let preview = $state({ account: '', busy: false, result: null });
+  function addRule() {
+    dir.rules = [...dir.rules, { viewers: [], members: [], fields: ['name', 'email'] }];
+  }
+  function toggleField(r, f) {
+    r.fields = r.fields.includes(f) ? r.fields.filter((x) => x !== f) : [...r.fields, f];
+  }
+  async function runPreview(e) {
+    e?.preventDefault();
+    preview.busy = true;
+    try {
+      preview.result = await get(`/admin/directory/preview?account=${encodeURIComponent(preview.account.trim())}`);
+    } catch (err) {
+      toast.error(err);
+      preview.result = null;
+    } finally {
+      preview.busy = false;
+    }
+  }
   let principals = $state([]);
   let accounts = $state([]);
   let server = $state(null);
@@ -158,8 +181,57 @@
         <label class="field"><span>Largest uploaded file (MB)</span><input class="input" type="number" min="1" value={mb(dav.max_resource_bytes)} onchange={(e) => (dav.max_resource_bytes = Math.max(1, Number(e.target.value)) * 1048576)} /></label>
       </div>
     </div>
-    <SaveBar {s} />
   {/if}
+
+  {#if dir}
+    <div class="card">
+      <h3>Contact directory</h3>
+      <p class="sub">A read-only “Directory” address book in each person’s contacts app, listing the people they may see. Groups and contact details come from single sign-on or the LDAP directory at each sign-in (see Sign-in &amp; access), or are set per account. Administrators see everyone with every field.</p>
+      <Toggle bind:checked={dir.enabled} label="Show the contact directory" hint="Off: nobody gets the directory book." disabled={!dav?.enabled} />
+      <label class="field" style="margin-top:10px"><span>Groups that see everyone</span>
+        <input class="input" value={list(dir.full_access_groups)} onchange={(e) => (dir.full_access_groups = parse(e.target.value))} placeholder="staff, helpdesk" disabled={!dir.enabled} />
+        <span class="hint">Comma-separated. Members see every person and every field, like administrators.</span></label>
+      <div class="row" style="margin-top:14px"><h4 style="margin:0">Rules</h4><span class="spacer"></span><button class="btn small" onclick={addRule} disabled={!dir.enabled}><Icon name="plus" size={14} /> Add rule</button></div>
+      {#if !dir.rules.length}<p class="muted small">No rules: people who don’t see everyone see nobody.</p>{/if}
+      {#each dir.rules as r, i}
+        <div class="rule">
+          <div class="grid2">
+            <label class="field"><span>Members of</span><input class="input" value={list(r.viewers)} onchange={(e) => (r.viewers = parse(e.target.value))} placeholder="family" /></label>
+            <label class="field"><span>see members of</span><input class="input" value={list(r.members)} onchange={(e) => (r.members = parse(e.target.value))} placeholder="family" /><span class="hint">* means everyone.</span></label>
+          </div>
+          <div class="fields">
+            {#each FIELDS as [f, label]}
+              <label class="check"><input type="checkbox" checked={r.fields.includes(f)} onchange={() => toggleField(r, f)} /> {label}</label>
+            {/each}
+          </div>
+          <button class="icon-btn" onclick={() => (dir.rules = dir.rules.filter((_, j) => j !== i))} aria-label="Remove rule" title="Remove rule"><Icon name="trash" size={16} /></button>
+        </div>
+      {/each}
+      <form class="row" style="margin-top:14px;gap:8px" onsubmit={runPreview}>
+        <input class="input" style="max-width:280px" placeholder="someone@example.com" bind:value={preview.account} list="dir-accounts" />
+        <datalist id="dir-accounts">{#each accounts as a}<option value={a.email}></option>{/each}</datalist>
+        <button class="btn" type="submit" disabled={!preview.account.trim() || preview.busy}>Preview</button>
+        <span class="hint">Uses the saved rules.</span>
+      </form>
+      {#if preview.result}
+        <div style="margin-top:10px">
+          {#if !preview.result.enabled}<p class="muted small">The directory is off.</p>
+          {:else}
+            {#if preview.result.hidden_by_own_book}<p class="small">This person has their own address book named “directory”, which takes its place. Rename or remove it to show the directory.</p>{/if}
+            <p class="small">{preview.result.account.email}{preview.result.account.groups.length ? ` (groups: ${preview.result.account.groups.join(', ')})` : ' (no groups)'} sees {preview.result.people.length} {preview.result.people.length === 1 ? 'person' : 'people'}{preview.result.full_access ? ', with every field' : ''}.</p>
+            {#if preview.result.people.length}
+              <table class="table"><thead><tr><th>Person</th><th>Fields shown</th></tr></thead><tbody>
+                {#each preview.result.people as x}
+                  <tr><td>{x.person.name || x.person.email || `Account ${x.person.id}`}{#if x.person.phone}<div class="muted small">{x.person.phone.join(', ')}</div>{/if}</td><td class="muted small">{x.fields.join(', ') || 'none (name hidden)'}</td></tr>
+                {/each}
+              </tbody></table>
+            {/if}
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
+  {#if dav}<SaveBar {s} />{/if}
 </div></div>
 
 <Modal title="New DAV user" bind:open={creating} width={520}>
@@ -231,4 +303,8 @@
   .urls { display: grid; grid-template-columns: 80px minmax(0, 1fr) auto; gap: 6px 12px; align-items: center; }
   .actions { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
   tr.off td { opacity: 0.7; }
+  .rule { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: start; padding: 12px 0; border-top: 1px solid var(--border, rgba(127,127,127,.2)); }
+  .rule .fields { grid-column: 1; display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  .rule .icon-btn { grid-column: 2; grid-row: 1; }
+  .check { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; }
 </style>

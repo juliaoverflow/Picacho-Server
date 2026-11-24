@@ -231,6 +231,8 @@ pub struct Claims {
     pub scope: String,
     pub exp: i64,
     pub client_id: Option<String>,
+    /// The whole verified payload (groups and contact-detail claims).
+    pub raw: Value,
 }
 
 /// Verify a JWT access token for this resource.
@@ -318,6 +320,7 @@ pub async fn verify(cfg: &OidcSettings, token: &str) -> Result<Claims, String> {
         scope,
         exp,
         client_id,
+        raw: c,
     })
 }
 
@@ -343,6 +346,27 @@ pub async fn principal(state: &State, token: &str) -> Option<Principal> {
             let link = format!("{}|{}", cfg.issuer.trim().trim_end_matches('/'), claims.sub);
             let account = state.db.account_by_oidc(&link).await.ok()??;
             let scopes = map_scopes(&claims.scope);
+            // Tokens rarely carry groups or profile claims; when they do, keep the
+            // directory current (absent claims change nothing). Most apps' tokens
+            // may carry a filtered groups claim, so they only add. Clients listed
+            // in token_groups_clients get the full claim, like sign-in: their
+            // groups replace the provider's and empty values clear.
+            let trusted = claims.client_id.as_ref().is_some_and(|c| cfg.token_groups_clients.iter().any(|t| t.trim() == c));
+            let groups = if cfg.groups_claim.is_empty() { None } else { crate::directory::claim_groups(claims.raw.get(&cfg.groups_claim)).filter(|g| trusted || !g.is_empty()) };
+            let details: std::collections::BTreeMap<_, _> = crate::directory::extract(&claims.raw, &cfg.profile_claims).into_iter().filter(|(_, v)| v.as_ref().is_some_and(|v| trusted || !v.is_empty())).collect();
+            if trusted {
+                // Same as a sign-in: replaces the identity provider's groups.
+                crate::directory::sync(state, account.id, "oidc", groups.as_deref(), &details).await;
+            } else {
+                if let Some(g) = groups.as_deref().filter(|g| !g.is_empty()) {
+                    if let Err(e) = state.db.add_account_groups(account.id, "oidc", g).await {
+                        tracing::warn!("directory groups from token for account {}: {e:#}", account.id);
+                    }
+                }
+                if !details.is_empty() {
+                    crate::directory::sync(state, account.id, "oidc", None, &details).await;
+                }
+            }
             if token_cache().len() > 50_000 {
                 token_cache().retain(|_, v| v.2 + 30 >= t);
             }

@@ -17,6 +17,7 @@ pub mod config;
 pub mod dav;
 pub mod db;
 pub mod dbx;
+pub mod directory;
 pub mod encryption;
 pub mod events;
 pub mod gssapi;

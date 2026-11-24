@@ -14,6 +14,7 @@
 //! (`[storage.dav]`), defaulting to the message store's backend.
 pub mod ical;
 pub mod jscal;
+mod directory;
 mod locks;
 mod props;
 mod report;
@@ -782,6 +783,10 @@ async fn handle(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<S
             return empty(if ctx.state.db.dav_principal(u).await.ok().flatten().is_some() { StatusCode::FORBIDDEN } else { StatusCode::NOT_FOUND });
         }
     }
+    // The contact directory is read-only, whatever the grant.
+    if writes && directory::touches(&ctx, &t, &headers).await {
+        return precondition(StatusCode::FORBIDDEN, DAV, "need-privileges");
+    }
     let r = match method.as_str() {
         "PROPFIND" => props::propfind(&ctx, &t, &headers, &body).await,
         "PROPPATCH" => props::proppatch(&ctx, &t, &headers, &body).await,
@@ -888,6 +893,9 @@ fn etag_of(data: &[u8]) -> String {
 }
 
 pub async fn read_blob(state: &State, n: &Node) -> Result<Vec<u8>> {
+    if let Some(c) = directory::content(n) {
+        return Ok(c);
+    }
     if n.blob.is_empty() {
         return Ok(vec![]);
     }
@@ -988,6 +996,9 @@ async fn get(ctx: &Ctx, t: &Target, h: &HeaderMap, head: bool) -> Result<Respons
         let body = format!("<!doctype html><title>DAV</title><p>Signed in as {}. Use a CalDAV, CardDAV or WebDAV client with <code>{}/dav/</code>.</p>", crate::xml::escape(&ctx.principal.username), crate::xml::escape(&ctx.base));
         return Ok(([(header::CONTENT_TYPE, "text/html; charset=utf-8")], if head { String::new() } else { body }).into_response());
     };
+    if directory::is_dir_path(path) && directory::active(ctx).await? {
+        return directory::get(ctx, path, h, head).await;
+    }
     let Some(n) = ctx.state.db.dav_node(ctx.principal.id, path).await? else { return Ok(empty(StatusCode::NOT_FOUND)) };
     if n.collection {
         return get_collection(ctx, user, &n, h, head).await;

@@ -49,6 +49,10 @@ pub struct Identity {
     pub email_verified: Option<bool>,
     pub name: Option<String>,
     pub groups: Vec<String>,
+    /// Whether the groups claim was there at all (absent: stored groups are kept).
+    pub groups_present: bool,
+    /// Contact details from mapped claims (see `crate::directory::extract`).
+    pub details: std::collections::BTreeMap<String, Option<Vec<String>>>,
 }
 
 fn pending() -> &'static DashMap<String, Pending> {
@@ -164,6 +168,22 @@ pub async fn begin(cfg: &OidcSettings, redirect_uri: &str, next: &str, setup: Op
     Ok(url.into())
 }
 
+/// Add claims from `extra` that `into` lacks, merging nested objects
+/// (so `attributes.title` from userinfo joins an `attributes` object in the ID token).
+fn fill_missing(into: &mut Value, extra: &Value) {
+    if let (Some(o), Some(i)) = (into.as_object_mut(), extra.as_object()) {
+        for (k, v) in i {
+            match o.get_mut(k) {
+                Some(cur) if cur.is_object() && v.is_object() => fill_missing(cur, v),
+                Some(_) => {}
+                None => {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+}
+
 fn claim_str(c: &Value, key: &str) -> Option<String> {
     c.get(key).and_then(|v| v.as_str()).map(String::from)
 }
@@ -234,16 +254,15 @@ pub async fn finish(code: &str, state_param: &str) -> Result<(Identity, Pending)
     let sub = claim_str(&claims, "sub").ok_or("ID token has no subject.")?;
     let mut all = claims.clone();
     // Fill missing claims from userinfo.
-    if claim_str(&all, &cfg.email_claim).is_none() || (!cfg.groups_claim.is_empty() && all.get(&cfg.groups_claim).is_none()) {
+    if claim_str(&all, &cfg.email_claim).is_none()
+        || (!cfg.groups_claim.is_empty() && all.get(&cfg.groups_claim).is_none())
+        || crate::directory::claims_missing(&all, &cfg.profile_claims)
+    {
         if let (Some(ui), Some(at)) = (&d.userinfo_endpoint, body.get("access_token").and_then(|v| v.as_str())) {
             if let Ok(r) = http().get(ui).bearer_auth(at).send().await {
                 if let Ok(info) = r.json::<Value>().await {
                     if claim_str(&info, "sub").as_deref() == Some(sub.as_str()) {
-                        if let (Some(o), Some(i)) = (all.as_object_mut(), info.as_object()) {
-                            for (k, v) in i {
-                                o.entry(k.clone()).or_insert(v.clone());
-                            }
-                        }
+                        fill_missing(&mut all, &info);
                     }
                 }
             }
@@ -255,6 +274,8 @@ pub async fn finish(code: &str, state_param: &str) -> Result<(Identity, Pending)
         email_verified: all.get("email_verified").and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true"))),
         name: claim_str(&all, "name").or_else(|| claim_str(&all, "preferred_username")),
         groups: claim_groups(&all, &cfg.groups_claim),
+        groups_present: !cfg.groups_claim.is_empty() && all.get(&cfg.groups_claim).is_some(),
+        details: crate::directory::extract(&all, &cfg.profile_claims),
     };
     Ok((id, p))
 }
@@ -322,5 +343,7 @@ pub async fn resolve_account(state: &State, cfg: &OidcSettings, id: &Identity) -
             a.role = want.into();
         }
     }
+    let groups = id.groups_present.then_some(id.groups.as_slice());
+    crate::directory::sync(state, a.id, "oidc", groups, &id.details).await;
     Ok(a)
 }

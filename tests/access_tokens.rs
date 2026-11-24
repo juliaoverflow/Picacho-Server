@@ -741,3 +741,67 @@ async fn rest_api() {
         .unwrap();
     assert_eq!(r.headers()["access-control-allow-origin"], "*");
 }
+
+/// Groups and contact details from access tokens feed the contact directory:
+/// most apps' tokens only add; trusted clients' tokens replace, like sign-in.
+#[tokio::test]
+async fn token_claims_sync_the_directory() {
+    let idp = Idp::start().await;
+    let s = start(&idp).await;
+    let http = reqwest::Client::new();
+    let r = http
+        .post(format!("{}/api/v1/accounts", s.base))
+        .bearer_auth(&s.admin)
+        .json(&json!({"email": "sam@sonoran.exchange", "display_name": "Sam", "oidc_subject": "user-sam"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let sam = s.state.db.account_by_email("sam@sonoran.exchange").await.unwrap().unwrap();
+    s.state.db.set_account_groups(sam.id, "oidc", &["family".into(), "hiking".into()]).await.unwrap();
+    let token = |client: &str, extra: Value| {
+        let now = chrono::Utc::now().timestamp();
+        let mut c = json!({"iss": idp.issuer, "aud": RESOURCE, "sub": "user-sam", "scope": "contacts.read",
+            "client_id": client, "iat": now, "exp": now + 600, "jti": uuid::Uuid::new_v4().to_string()});
+        for (k, v) in extra.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        idp.sign(json!({"alg": "ES256", "typ": "at+jwt", "kid": "k1"}), c)
+    };
+    let use_token = |t: String| {
+        let base = s.base.clone();
+        async move {
+            let r = reqwest::Client::new()
+                .request("PROPFIND".parse().unwrap(), format!("{base}/dav/"))
+                .bearer_auth(t)
+                .header("depth", "0")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 207);
+        }
+    };
+    let groups = || async { let mut g = s.state.db.account_groups(sam.id).await.unwrap(); g.sort(); g };
+
+    // An ordinary app's token with a filtered groups claim only adds.
+    use_token(token("app", json!({"groups": ["work"], "phone_number": "+1 520 555 0177"}))).await;
+    assert_eq!(groups().await, vec!["family", "hiking", "work"]);
+    assert_eq!(s.state.db.account_profile(sam.id).await.unwrap()["phone"], vec!["+1 520 555 0177".to_string()]);
+    use_token(token("app", json!({"groups": [], "phone_number": ""}))).await;
+    assert_eq!(groups().await, vec!["family", "hiking", "work"]);
+    assert!(s.state.db.account_profile(sam.id).await.unwrap().contains_key("phone"));
+
+    // A trusted client's token is authoritative.
+    let mut set = (*s.state.settings()).clone();
+    set.auth.oidc.token_groups_clients = vec!["pinal-mail".into()];
+    s.state.save_settings(set).await.unwrap();
+    use_token(token("pinal-mail", json!({"groups": ["family"]}))).await;
+    assert_eq!(groups().await, vec!["family"]);
+    use_token(token("pinal-mail", json!({"groups": [], "phone_number": null}))).await;
+    assert!(groups().await.is_empty());
+    assert!(!s.state.db.account_profile(sam.id).await.unwrap().contains_key("phone"));
+    // Absent claims still change nothing.
+    s.state.db.set_account_groups(sam.id, "oidc", &["family".into()]).await.unwrap();
+    use_token(token("pinal-mail", json!({}))).await;
+    assert_eq!(groups().await, vec!["family"]);
+}

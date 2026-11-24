@@ -37,6 +37,9 @@ fn problem(kind: &str, detail: &str, id: Option<&Value>) -> String {
 
 async fn session(state: State, account: crate::db::Account, level: crate::auth::Access, mut socket: WebSocket) {
     let mut push: Option<i64> = None;
+    // The contact directory changes when other people do; look every few seconds.
+    let mut dir_seen: Option<i64> = None;
+    let mut ticks: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let shutdown = state.shutdown.clone();
     loop {
@@ -98,13 +101,21 @@ async fn session(state: State, account: crate::db::Account, level: crate::auth::
                 }
             }
             _ = tick.tick(), if push.is_some() => {
+                ticks += 1;
                 let now = state.db.jmap_state(account.id).await.unwrap_or(0);
-                if Some(now) != push {
+                let dir_on = state.settings().directory.enabled;
+                let mut dir_now = dir_seen;
+                if dir_on && (ticks.is_multiple_of(5) || dir_seen.is_none()) && crate::directory::refresh(&state, &account).await.is_ok() {
+                    dir_now = state.db.directory_state(account.id).await.ok();
+                }
+                let dir_moved = dir_seen.is_some() && dir_now != dir_seen;
+                if dir_seen.is_none() {
+                    dir_seen = dir_now;
+                }
+                if Some(now) != push || dir_moved {
                     push = Some(now);
-                    let st = now.to_string();
-                    let ev = json!({"@type": "StateChange", "changed": {super::account_id(&account): {
-                        "Email": st, "Mailbox": st, "Thread": st, "EmailDelivery": st, "EmailSubmission": st, "Identity": st,
-                        "Calendar": st, "CalendarEvent": st, "AddressBook": st, "ContactCard": st}}, "pushState": st});
+                    dir_seen = dir_now;
+                    let ev = json!({"@type": "StateChange", "changed": {super::account_id(&account): super::push_types(now, dir_now.filter(|_| dir_on), None)}, "pushState": now.to_string()});
                     if socket.send(Message::Text(ev.to_string().into())).await.is_err() {
                         return;
                     }

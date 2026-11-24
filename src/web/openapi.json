@@ -295,6 +295,30 @@
       ]
      }
     }
+   },
+   "AccountGroups": {
+    "type": "object",
+    "properties": {
+     "groups": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "source": {
+         "type": "string",
+         "enum": [
+          "oidc",
+          "ldap",
+          "manual"
+         ]
+        }
+       }
+      }
+     }
+    }
    }
   }
  },
@@ -1491,6 +1515,203 @@
       "description": "Account id or email"
      }
     ]
+   }
+  },
+  "/accounts/{id}/groups": {
+   "get": {
+    "summary": "Groups used by the contact directory (synced from single sign-on and LDAP, or set here)",
+    "tags": [
+     "Accounts"
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The account's groups and where each comes from",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AccountGroups"
+        }
+       }
+      }
+     }
+    }
+   },
+   "put": {
+    "summary": "Set the groups given by hand (synced groups are kept)",
+    "tags": [
+     "Accounts"
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The account's groups and where each comes from",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AccountGroups"
+        }
+       }
+      }
+     }
+    },
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "groups"
+        ],
+        "properties": {
+         "groups": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/accounts/{id}/profile": {
+   "get": {
+    "summary": "Contact details synced from identity-provider claims or LDAP attributes",
+    "tags": [
+     "Accounts"
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "field -> values",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "profile": {
+           "type": "object",
+           "additionalProperties": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/directory/preview": {
+   "get": {
+    "summary": "Who an account sees in the contact directory, with which fields (saved rules)",
+    "tags": [
+     "Accounts"
+    ],
+    "parameters": [
+     {
+      "name": "account",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "Account id or email"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Visible people",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "enabled": {
+           "type": "boolean"
+          },
+          "full_access": {
+           "type": "boolean"
+          },
+          "account": {
+           "type": "object",
+           "properties": {
+            "id": {
+             "type": "integer"
+            },
+            "email": {
+             "type": "string"
+            },
+            "groups": {
+             "type": "array",
+             "items": {
+              "type": "string"
+             }
+            }
+           }
+          },
+          "people": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "person": {
+              "type": "object",
+              "description": "id plus the visible fields"
+             },
+             "fields": {
+              "type": "array",
+              "items": {
+               "type": "string"
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
    }
   }
  }

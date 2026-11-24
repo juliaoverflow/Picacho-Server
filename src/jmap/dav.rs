@@ -6,6 +6,10 @@
 //! calendar and each card in one address book. Writes go through the same
 //! validation, quota and sync-token bookkeeping as CalDAV/CardDAV, so both
 //! protocols always see the same data.
+//!
+//! The contact directory (`crate::directory`) appears as one more, read-only
+//! address book `bdir` with cards `kd<account>`. Its changes are tracked per
+//! viewer, so AddressBook/ContactCard states are `<state>.<directory state>`.
 use super::mail::{ids_arg, num_id, pick, set_error, state_str};
 use super::{account_id, Ctx, MethodError};
 use crate::dav::jscal;
@@ -78,6 +82,64 @@ async fn objects(ctx: &Ctx, p: &Principal, kind: Kind) -> Result<Vec<(i64, Node)
         }
     }
     Ok(out)
+}
+
+// ---- the contact directory as a read-only address book
+
+const DIR_BOOK: &str = "bdir";
+const DIR_CARD: &str = "kd";
+
+fn is_dir_id(id: &str) -> bool {
+    id == DIR_BOOK || id.starts_with(DIR_CARD)
+}
+
+/// The viewer's directory cards, or None when it's off for them (or a real
+/// address book named "directory" hides it, as over CardDAV).
+async fn dir_book(ctx: &Ctx, p: &Principal) -> Result<Option<crate::directory::Book>, MethodError> {
+    if !ctx.state.settings().directory.enabled || ctx.state.db.dav_node(p.id, "addressbooks/directory").await?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(crate::directory::refresh(&ctx.state, &ctx.account).await?))
+}
+
+fn dir_book_json() -> Map<String, Value> {
+    let mut o = Map::new();
+    o.insert("id".into(), json!(DIR_BOOK));
+    o.insert("name".into(), json!("Directory"));
+    o.insert("description".into(), json!("People you can see on this server (read-only)"));
+    o.insert("sortOrder".into(), json!(1000));
+    o.insert("isSubscribed".into(), json!(true));
+    o.insert("isDefault".into(), json!(false));
+    o.insert("shareWith".into(), Value::Null);
+    o.insert("myRights".into(), json!({"mayRead": true, "mayWrite": false, "mayShare": false, "mayDelete": false}));
+    o
+}
+
+fn dir_card_json(id: i64, text: &str) -> Option<Map<String, Value>> {
+    let comp = ical::parse(text).ok()?;
+    let mut o = jscal::to_jscontact(&comp);
+    o.insert("id".into(), json!(format!("{DIR_CARD}{id}")));
+    o.insert("addressBookIds".into(), json!({DIR_BOOK: true}));
+    Some(o)
+}
+
+/// State for address books and cards: the account's plus the directory's.
+async fn contacts_state(ctx: &Ctx) -> Result<String, MethodError> {
+    let base = state_str(ctx).await?;
+    if !ctx.state.settings().directory.enabled {
+        return Ok(base);
+    }
+    // Bring the directory's change log up to date so the state is current.
+    crate::directory::refresh(&ctx.state, &ctx.account).await?;
+    Ok(format!("{base}.{}", ctx.state.db.directory_state(ctx.account.id).await?))
+}
+
+/// Split a contacts state into (account state, directory state).
+fn split_state(s: &str) -> Option<(i64, i64)> {
+    match s.split_once('.') {
+        Some((a, d)) => Some((a.parse().ok()?, d.parse().ok()?)),
+        None => Some((s.parse().ok()?, 0)),
+    }
 }
 
 fn rights_calendar() -> Value {
@@ -183,7 +245,8 @@ async fn no_changes(ctx: &Ctx, args: &Value) -> Result<Value, MethodError> {
 
 async fn get(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodError> {
     let p = principal(ctx).await?;
-    let st = state_str(ctx).await?;
+    let dir = if kind.home() == "addressbooks" { dir_book(ctx, &p).await? } else { None };
+    let st = if kind.home() == "addressbooks" { contacts_state(ctx).await? } else { state_str(ctx).await? };
     let ids = ids_arg(ctx, args)?;
     let props: Option<Vec<String>> = args.get("properties").and_then(|v| v.as_array()).map(|a| {
         let mut v: Vec<String> = a.iter().filter_map(|x| x.as_str().map(String::from)).collect();
@@ -198,7 +261,10 @@ async fn get(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodErr
     if kind.collection() {
         let colls = collections(ctx, &p, kind).await?;
         let first = colls.first().map(|c| c.id);
-        let all: Vec<Value> = colls.iter().map(|c| filter(collection_json(kind, c, Some(c.id) == first))).collect();
+        let mut all: Vec<Value> = colls.iter().map(|c| filter(collection_json(kind, c, Some(c.id) == first))).collect();
+        if dir.is_some() {
+            all.push(filter(dir_book_json()));
+        }
         match ids {
             None => list = all,
             Some(ids) => {
@@ -213,11 +279,23 @@ async fn get(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodErr
     } else {
         let objs = objects(ctx, &p, kind).await?;
         let by_id: HashMap<i64, &(i64, Node)> = objs.iter().map(|o| (o.1.id, o)).collect();
-        let wanted: Vec<String> = ids.unwrap_or_else(|| objs.iter().map(|(_, n)| format!("{}{}", kind.prefix(), n.id)).collect());
+        let dir_cards: HashMap<String, &String> = dir.as_ref().map(|b| b.cards.iter().map(|c| (format!("{DIR_CARD}{}", c.0), &c.2)).collect()).unwrap_or_default();
+        let wanted: Vec<String> = ids.unwrap_or_else(|| {
+            let mut v: Vec<String> = objs.iter().map(|(_, n)| format!("{}{}", kind.prefix(), n.id)).collect();
+            v.extend(dir.iter().flat_map(|b| b.cards.iter().map(|c| format!("{DIR_CARD}{}", c.0))));
+            v
+        });
         if wanted.len() > super::MAX_OBJECTS {
             return Err(MethodError("requestTooLarge", "Too many ids.".into()));
         }
         for id in wanted {
+            if let Some(text) = dir_cards.get(&id) {
+                match dir_card_json(id[DIR_CARD.len()..].parse().unwrap_or(0), text) {
+                    Some(o) => list.push(filter(o)),
+                    None => not_found.push(id),
+                }
+                continue;
+            }
             match num_id(&id, kind.prefix()).and_then(|n| by_id.get(&n)) {
                 Some((c, n)) => match object_json(ctx, kind, *c, n).await {
                     Some(o) => list.push(filter(o)),
@@ -232,7 +310,8 @@ async fn get(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodErr
 
 async fn changes(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodError> {
     let since_s = args.get("sinceState").and_then(|v| v.as_str()).ok_or_else(|| MethodError::invalid("sinceState is required"))?;
-    let since: i64 = since_s.parse().map_err(|_| MethodError("cannotCalculateChanges", "Unknown state.".into()))?;
+    let contacts = kind.home() == "addressbooks";
+    let (since, dir_since) = if contacts { split_state(since_s) } else { since_s.parse().ok().map(|s| (s, 0)) }.ok_or_else(|| MethodError("cannotCalculateChanges", "Unknown state.".into()))?;
     let max = args.get("maxChanges").and_then(|v| v.as_i64()).unwrap_or(5000).clamp(1, 50_000);
     let Some((rows, new_state, more)) = ctx.state.db.changes_since(ctx.account.id, kind.type_name(), since, max).await? else {
         return Err(MethodError("cannotCalculateChanges", "State too old; fetch everything again.".into()));
@@ -255,7 +334,49 @@ async fn changes(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, Metho
             _ => updated.push(sid),
         }
     }
-    let mut out = json!({"accountId": account_id(&ctx.account), "oldState": since_s, "newState": new_state.to_string(),
+    let mut new_state = new_state.to_string();
+    if contacts {
+        let p = principal(ctx).await?;
+        match dir_book(ctx, &p).await? {
+            Some(b) => {
+                if kind == Kind::Card && !more {
+                    // Each change knows when the person became visible: after the
+                    // client's state means "created", before means "updated"; a
+                    // removal is only reported if the client could have had the card.
+                    for c in ctx.state.db.directory_changes_detail(ctx.account.id, dir_since).await? {
+                        let sid = format!("{DIR_CARD}{}", c.person);
+                        if c.deleted {
+                            if c.added == 0 || c.added <= dir_since {
+                                destroyed.push(sid);
+                            }
+                        } else if dir_since == 0 || c.added > dir_since {
+                            created.push(sid);
+                        } else {
+                            updated.push(sid);
+                        }
+                    }
+                }
+                // A state from before the directory was on (no ".n" part) hasn't seen the book.
+                if kind == Kind::Book && !since_s.contains('.') && !more {
+                    created.push(DIR_BOOK.into());
+                }
+                // With more account changes pending, keep the directory state so
+                // its changes are reported once the account's are done.
+                new_state = format!("{new_state}.{}", if more { dir_since } else { b.state });
+            }
+            None if since_s.contains('.') => {
+                // The directory was turned off: its book and cards are gone.
+                if kind == Kind::Book {
+                    destroyed.push(DIR_BOOK.into());
+                }
+                if kind == Kind::Card {
+                    return Err(MethodError("cannotCalculateChanges", "The directory changed; fetch everything again.".into()));
+                }
+            }
+            None => {}
+        }
+    }
+    let mut out = json!({"accountId": account_id(&ctx.account), "oldState": since_s, "newState": new_state,
         "hasMoreChanges": more, "created": created, "updated": updated, "destroyed": destroyed});
     if kind.collection() {
         out["updatedProperties"] = Value::Null;
@@ -353,6 +474,16 @@ async fn run_query(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Vec<String
         };
         hits.push((format!("{}{}", kind.prefix(), n.id), key, n.updated_at));
     }
+    if kind == Kind::Card {
+        for (id, _, text) in dir_book(ctx, &p).await?.map(|b| b.cards).unwrap_or_default() {
+            let Some(o) = dir_card_json(id, &text) else { continue };
+            if !filter.is_null() && !matches(&o, &filter, ctx)? {
+                continue;
+            }
+            let key = o.get("name").and_then(|x| x["full"].as_str()).unwrap_or("").to_lowercase();
+            hits.push((format!("{DIR_CARD}{id}"), key, 0));
+        }
+    }
     let sort = args.get("sort").and_then(|v| v.as_array()).and_then(|a| a.first()).cloned();
     let asc = sort.as_ref().and_then(|s| s.get("isAscending")).and_then(|v| v.as_bool()).unwrap_or(true);
     match sort.as_ref().and_then(|s| s.get("property")).and_then(|v| v.as_str()) {
@@ -380,7 +511,8 @@ async fn query(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodE
     }
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10_000).min(10_000) as usize;
     let page: Vec<String> = ids.into_iter().skip(position as usize).take(limit).collect();
-    let mut out = json!({"accountId": account_id(&ctx.account), "queryState": state_str(ctx).await?, "canCalculateChanges": true, "position": position, "ids": page});
+    let qs = if kind == Kind::Card { contacts_state(ctx).await? } else { state_str(ctx).await? };
+    let mut out = json!({"accountId": account_id(&ctx.account), "queryState": qs, "canCalculateChanges": true, "position": position, "ids": page});
     if args.get("calculateTotal").and_then(|v| v.as_bool()).unwrap_or(false) {
         out["total"] = json!(total);
     }
@@ -391,7 +523,7 @@ async fn query(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodE
 /// still matches, added at its current index (RFC 8620 5.6 allows it).
 async fn query_changes(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodError> {
     let since_s = args.get("sinceQueryState").and_then(|v| v.as_str()).ok_or_else(|| MethodError::invalid("sinceQueryState is required"))?;
-    let since: i64 = since_s.parse().map_err(|_| MethodError("cannotCalculateChanges", "Unknown state.".into()))?;
+    let (since, dir_since) = split_state(since_s).ok_or_else(|| MethodError("cannotCalculateChanges", "Unknown state.".into()))?;
     let Some((rows, _, more)) = ctx.state.db.changes_since(ctx.account.id, kind.type_name(), since, 50_000).await? else {
         return Err(MethodError("cannotCalculateChanges", "State too old; run the query again.".into()));
     };
@@ -405,6 +537,11 @@ async fn query_changes(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value,
             removed.push(s);
         }
     }
+    if kind == Kind::Card && ctx.state.settings().directory.enabled {
+        for (person, _) in ctx.state.db.directory_changes_since(ctx.account.id, dir_since).await? {
+            removed.push(format!("{DIR_CARD}{person}"));
+        }
+    }
     let ids = run_query(ctx, kind, args).await?;
     let up_to = args.get("upToId").and_then(|v| v.as_str()).map(|s| ctx.id(s));
     let cutoff = up_to.and_then(|u| ids.iter().position(|i| *i == u)).unwrap_or(usize::MAX);
@@ -413,7 +550,8 @@ async fn query_changes(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value,
     if removed.len() + added.len() > max {
         return Err(MethodError("tooManyChanges", "More changes than maxChanges.".into()));
     }
-    let mut out = json!({"accountId": account_id(&ctx.account), "oldQueryState": since_s, "newQueryState": state_str(ctx).await?, "removed": removed, "added": added});
+    let nqs = if kind == Kind::Card { contacts_state(ctx).await? } else { state_str(ctx).await? };
+    let mut out = json!({"accountId": account_id(&ctx.account), "oldQueryState": since_s, "newQueryState": nqs, "removed": removed, "added": added});
     if args.get("calculateTotal").and_then(|v| v.as_bool()).unwrap_or(false) {
         out["total"] = json!(ids.len());
     }
@@ -494,9 +632,12 @@ async fn write_object(ctx: &Ctx, p: &Principal, kind: Kind, coll: &Node, existin
 async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
     let name = format!("{}/set", kind.type_name());
     let p = principal(ctx).await?;
-    let old_state = state_str(ctx).await?;
+    let contacts = kind.home() == "addressbooks";
+    let old_state = if contacts { contacts_state(ctx).await? } else { state_str(ctx).await? };
     if let Some(s) = args.get("ifInState").and_then(|v| v.as_str()) {
-        if s != old_state {
+        // The directory can't be written here, so only the account's part counts.
+        let own = |x: &str| x.split('.').next().unwrap_or(x).to_string();
+        if own(s) != own(&old_state) {
             return Err(MethodError("stateMismatch", "The state has changed.".into()));
         }
     }
@@ -543,6 +684,10 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
                     o.insert(key.into(), Value::Object(m.into_iter().map(|(k, v)| (ctx.id(&k), v)).collect()));
                 }
             }
+            if o.get("addressBookIds").and_then(|m| m.get(DIR_BOOK)).is_some() {
+                not_created.insert(cid.clone(), set_error("forbidden", "The directory is read-only"));
+                continue;
+            }
             let colls = collections(ctx, &p, kind).await?;
             let Some(coll) = target_collection(kind, &o, &colls, ctx) else {
                 not_created.insert(cid.clone(), set_error("invalidProperties", "Name exactly one calendar or address book"));
@@ -564,6 +709,10 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
     if let Some(u) = args.get("update").and_then(|v| v.as_object()) {
         for (id, patch) in u {
             let id = ctx.id(id);
+            if is_dir_id(&id) || patch.get("addressBookIds").and_then(|m| m.get(DIR_BOOK)).is_some() || patch.get(format!("addressBookIds/{DIR_BOOK}")).is_some() {
+                not_updated.insert(id, set_error("forbidden", "The directory is read-only"));
+                continue;
+            }
             let Some(patch) = patch.as_object() else {
                 not_updated.insert(id, set_error("invalidPatch", "not an object"));
                 continue;
@@ -644,6 +793,10 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
     if let Some(d) = args.get("destroy").and_then(|v| v.as_array()) {
         let remove_contents = args.get("onDestroyRemoveEvents").or(args.get("onDestroyRemoveContents")).and_then(|v| v.as_bool()).unwrap_or(false);
         for id in d.iter().filter_map(|v| v.as_str()).map(|s| ctx.id(s)) {
+            if is_dir_id(&id) {
+                not_destroyed.insert(id, set_error("forbidden", "The directory is read-only"));
+                continue;
+            }
             let n = num_id(&id, kind.prefix()).unwrap_or(-1);
             let node = if kind.collection() {
                 colls.iter().find(|c| c.id == n).cloned()
@@ -667,7 +820,7 @@ async fn set(ctx: &mut Ctx, kind: Kind, args: &Value) -> R {
     }
     Ok(vec![(
         name,
-        json!({"accountId": account_id(&ctx.account), "oldState": old_state, "newState": state_str(ctx).await?,
+        json!({"accountId": account_id(&ctx.account), "oldState": old_state, "newState": if contacts { contacts_state(ctx).await? } else { state_str(ctx).await? },
             "created": created, "notCreated": not_created, "updated": updated, "notUpdated": not_updated,
             "destroyed": destroyed, "notDestroyed": not_destroyed}),
     )])
@@ -686,11 +839,23 @@ async fn copy(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodEr
     let colls = collections(ctx, &p, kind).await?;
     for (cid, obj) in args.get("create").and_then(|v| v.as_object()).into_iter().flatten() {
         let src = obj.get("id").and_then(|v| v.as_str()).map(|s| ctx.id(s)).unwrap_or_default();
-        let Some((c, n)) = num_id(&src, kind.prefix()).and_then(|x| objs.iter().find(|(_, o)| o.id == x)) else {
+        let found = if kind == Kind::Card && src.starts_with(DIR_CARD) {
+            // From the directory into one's own address book ("save contact").
+            let cards = dir_book(ctx, &p).await?.map(|b| b.cards).unwrap_or_default();
+            cards.into_iter().find(|c| format!("{DIR_CARD}{}", c.0) == src).and_then(|c| dir_card_json(c.0, &c.2)).map(|mut o| {
+                o.remove("addressBookIds");
+                o
+            })
+        } else {
+            match num_id(&src, kind.prefix()).and_then(|x| objs.iter().find(|(_, o)| o.id == x)) {
+                Some((c, n)) => object_json(ctx, kind, *c, n).await,
+                None => None,
+            }
+        };
+        let Some(mut o) = found else {
             not_created.insert(cid.clone(), set_error("notFound", "No such object"));
             continue;
         };
-        let Some(mut o) = object_json(ctx, kind, *c, n).await else { continue };
         if let Some(extra) = obj.as_object() {
             for (k, v) in extra.iter().filter(|(k, _)| *k != "id") {
                 o.insert(k.clone(), v.clone());
@@ -698,6 +863,10 @@ async fn copy(ctx: &mut Ctx, kind: Kind, args: &Value) -> Result<Value, MethodEr
         }
         // A copy is a new object: a new UID.
         o.insert("uid".into(), json!(uuid::Uuid::new_v4().to_string()));
+        if o.get("addressBookIds").and_then(|m| m.get(DIR_BOOK)).is_some() {
+            not_created.insert(cid.clone(), set_error("forbidden", "The directory is read-only"));
+            continue;
+        }
         let Some(coll) = target_collection(kind, &o, &colls, ctx) else {
             not_created.insert(cid.clone(), set_error("invalidProperties", "Name exactly one calendar or address book"));
             continue;

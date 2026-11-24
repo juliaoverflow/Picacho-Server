@@ -1682,6 +1682,9 @@ fn ext_admin_routes() -> Router<State> {
         .route("/accounts/{id}/migrate", post(admin_migrate))
         .route("/migrations/{id}", get(migration_status))
         .route("/accounts/{id}/dav", get(admin_account_dav))
+        .route("/accounts/{id}/groups", get(admin_get_groups).put(admin_put_groups))
+        .route("/accounts/{id}/profile", get(admin_get_profile))
+        .route("/directory/preview", get(directory_preview))
 }
 
 /// Endpoints of this server, for identity providers and provisioning tools.
@@ -2015,6 +2018,62 @@ async fn admin_account_dav(AxState(state): AxState<State>, headers: HeaderMap, P
     admin(&state, &headers).await?;
     let acc = resolve_account(&state, &key).await?;
     Ok(Json(json!(state.db.dav_principal_for_account(acc.id).await?)))
+}
+
+// ---------------------------------------------------------------- contact directory
+
+async fn groups_json(state: &State, id: i64) -> R {
+    let rows = state.db.account_group_sources(id).await?;
+    Ok(Json(json!({"groups": rows.iter().map(|(n, s)| json!({"name": n, "source": s})).collect::<Vec<_>>()})))
+}
+
+async fn admin_get_groups(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>) -> R {
+    admin(&state, &headers).await?;
+    let acc = resolve_account(&state, &key).await?;
+    groups_json(&state, acc.id).await
+}
+
+#[derive(Deserialize)]
+struct GroupsPut {
+    /// The groups set by hand (synced groups are kept).
+    groups: Vec<String>,
+}
+
+async fn admin_put_groups(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>, Json(b): Json<GroupsPut>) -> R {
+    admin(&state, &headers).await?;
+    let acc = resolve_account(&state, &key).await?;
+    if b.groups.len() > 500 || b.groups.iter().any(|g| g.len() > 512 || g.chars().any(|c| c.is_control())) {
+        return Err(bad("Too many groups, or a group name is too long."));
+    }
+    state.db.set_account_groups(acc.id, "manual", &b.groups).await?;
+    groups_json(&state, acc.id).await
+}
+
+async fn admin_get_profile(AxState(state): AxState<State>, headers: HeaderMap, Path(key): Path<String>) -> R {
+    admin(&state, &headers).await?;
+    let acc = resolve_account(&state, &key).await?;
+    Ok(Json(json!({"profile": state.db.account_profile(acc.id).await?})))
+}
+
+#[derive(Deserialize)]
+struct PreviewQuery {
+    account: String,
+}
+
+/// Who an account sees in the contact directory, with which fields. Uses
+/// the saved rules; send `?account=` (address or id).
+async fn directory_preview(AxState(state): AxState<State>, headers: HeaderMap, Query(q): Query<PreviewQuery>) -> R {
+    admin(&state, &headers).await?;
+    let acc = resolve_account(&state, q.account.trim()).await?;
+    let entries = crate::directory::load_entries(&state).await?;
+    let me = entries.iter().find(|e| e.id == acc.id).ok_or_else(not_found)?;
+    let mut v = crate::directory::preview(me, &entries, &state.settings().directory);
+    v["account"] = json!({"id": acc.id, "email": acc.email, "groups": me.groups});
+    // An address book of their own named "directory" (from before it was on) hides it.
+    if let Some(p) = state.db.dav_principal_for_account(acc.id).await? {
+        v["hidden_by_own_book"] = json!(state.db.dav_node(p.id, "addressbooks/directory").await?.is_some());
+    }
+    Ok(Json(v))
 }
 
 // ---------------------------------------------------------------- sieve & vacation (shared by admin and /me)
