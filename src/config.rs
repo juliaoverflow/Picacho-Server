@@ -294,6 +294,9 @@ pub struct Web {
     pub metrics_allow: Vec<String>,
     /// Bearer token that also grants access to /metrics.
     pub metrics_token_file: Option<PathBuf>,
+    /// Publish accounts' OpenPGP keys (their encryption-at-rest keys) in
+    /// the Web Key Directory at /.well-known/openpgpkey.
+    pub wkd: bool,
 }
 
 impl Default for Web {
@@ -307,6 +310,7 @@ impl Default for Web {
             metrics: true,
             metrics_allow: vec!["127.0.0.1".into(), "::1".into()],
             metrics_token_file: None,
+            wkd: true,
         }
     }
 }

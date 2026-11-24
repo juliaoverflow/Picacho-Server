@@ -100,6 +100,7 @@
 # metrics = true                  # Prometheus at /metrics
 # metrics_allow = ["127.0.0.1", "::1"]
 # metrics_token_file = "/run/secrets/metrics-token"   # or Authorization: Bearer <token>
+# wkd = true                      # publish accounts' encryption keys (Web Key Directory, /.well-known/openpgpkey)
 
 [log]
 # level = "info"                  # or a filter like "info,picacho_server=debug"

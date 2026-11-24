@@ -18,6 +18,7 @@
 use crate::state::State;
 use pgp::composed::{ArmorOptions, Deserializable, MessageBuilder, SignedPublicKey, SignedPublicSubKey};
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use pgp::ser::Serialize;
 use pgp::types::KeyDetails;
 
 /// A usable recipient key: (key, uppercase hex fingerprint).
@@ -32,6 +33,31 @@ pub fn parse_key(armored: &str) -> Result<(SignedPublicKey, String), String> {
     }
     let fp = format!("{:X}", key.fingerprint());
     Ok((key, fp))
+}
+
+/// The account's key as the Web Key Directory serves it for `email`:
+/// binary, with only the User IDs for that address (none of the owner's
+/// other addresses, no photo IDs, as GnuPG's `keep-uid=mbox=` export
+/// filter does), or None when no User ID names it.
+pub fn wkd_key(armored: &str, email: &str) -> Option<Vec<u8>> {
+    let (mut key, _) = parse_key(armored).ok()?;
+    let email = email.trim().to_lowercase();
+    key.details.users.retain(|u| user_id_address(u.id.id()) == email);
+    if key.details.users.is_empty() {
+        return None;
+    }
+    key.details.user_attributes.clear();
+    key.to_bytes().ok()
+}
+
+/// The address in a User ID (`Name <addr>` or a bare `addr`), lowercased;
+/// the same reading as the Picacho app's `has_address`.
+fn user_id_address(id: &[u8]) -> String {
+    let u = String::from_utf8_lossy(id).to_lowercase();
+    match (u.rfind('<'), u.rfind('>')) {
+        (Some(a), Some(b)) if a < b => u[a + 1..b].to_string(),
+        _ => u.trim().to_string(),
+    }
 }
 
 fn encryption_subkeys(key: &SignedPublicKey) -> Vec<&SignedPublicSubKey> {
@@ -121,4 +147,48 @@ pub async fn for_storage(state: &State, account_id: i64, raw: &[u8]) -> anyhow::
     })
     .await??;
     Ok(std::borrow::Cow::Owned(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_for(primary: &str, others: &[&str]) -> String {
+        use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
+        use pgp::crypto::ecc_curve::ECCCurve;
+        let mut encrypt = SubkeyParamsBuilder::default();
+        encrypt.key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy)).can_sign(false).can_encrypt(EncryptionCaps::All);
+        let mut params = SecretKeyParamsBuilder::default();
+        params
+            .key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(true)
+            .can_encrypt(EncryptionCaps::None)
+            .primary_user_id(primary.into())
+            .user_ids(others.iter().map(|s| s.to_string()).collect())
+            .subkeys(vec![encrypt.build().unwrap()]);
+        let secret = params.build().unwrap().generate(rand08::thread_rng()).unwrap();
+        SignedPublicKey::from(secret).to_armored_string(ArmorOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn wkd_key_keeps_only_the_requested_address() {
+        let armored = key_for("Amy <amy@example.test>", &["amy.private@elsewhere.test", "Amy Sales <SALES@example.test>"]);
+        let (full, fp) = parse_key(&armored).unwrap();
+        assert_eq!(full.details.users.len(), 3);
+
+        let bytes = wkd_key(&armored, "Sales@Example.test").unwrap();
+        assert_ne!(bytes.first(), Some(&b'-'), "binary, not armored");
+        let served = SignedPublicKey::from_bytes(&bytes[..]).unwrap();
+        served.verify_bindings().unwrap();
+        assert_eq!(format!("{:X}", served.fingerprint()), fp);
+        let ids: Vec<String> = served.details.users.iter().map(|u| String::from_utf8_lossy(u.id.id()).into_owned()).collect();
+        assert_eq!(ids, ["Amy Sales <SALES@example.test>"]);
+        assert_eq!(served.public_subkeys.len(), 1, "the encryption subkey goes along");
+
+        let bare = SignedPublicKey::from_bytes(&wkd_key(&armored, "amy.private@elsewhere.test").unwrap()[..]).unwrap();
+        assert_eq!(bare.details.users.len(), 1);
+        assert!(wkd_key(&armored, "bob@example.test").is_none(), "no User ID for the address: nothing published");
+        assert!(wkd_key(&armored, "my@example.test").is_none(), "a suffix of an address isn't it");
+    }
 }

@@ -1,8 +1,8 @@
 //! Protocol extensions the Picacho mail app uses (see ../Picacho's
 //! docs/SYNCHRONIZATION.md): IMAP OBJECTID, SAVEDATE, PREVIEW, APPENDLIMIT,
 //! SEARCHRES and REPLACE; SMTP FUTURERELEASE and LIMITS; JMAP submissions,
-//! identities, blobs, Email/parse and MDN/send; and Pinal Mail's
-//! encryption at rest.
+//! identities, blobs, Email/parse and MDN/send; Pinal Mail's encryption at
+//! rest; and the Web Key Directory the app looks keys up in.
 use picacho_server::config::Config;
 use picacho_server::server::{spawn_listener, Proto};
 use picacho_server::state::{AppState, State};
@@ -640,6 +640,119 @@ async fn pinal_encryption_at_rest() {
     let rows = s.state.db.messages_by_uids(mb.id, 1, 1_000_000).await.unwrap();
     let stored = s.state.blobs.get(&rows[2].blob).await.unwrap();
     assert!(String::from_utf8_lossy(&stored).contains("Readable again"));
+}
+
+// ------------------------------------------------------------ Web Key Directory
+
+/// The WKD hash of a local part, as the Picacho app computes it
+/// (sync/keys.rs `wkd_urls`).
+fn wkd_hash(local: &str) -> String {
+    const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, local.to_ascii_lowercase().as_bytes());
+    let (mut out, mut buffer, mut bits) = (String::new(), 0u32, 0);
+    for &b in digest.as_ref() {
+        buffer = (buffer << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            out.push(ALPHABET[((buffer >> (bits - 5)) & 31) as usize] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+#[tokio::test]
+async fn web_key_directory_publishes_account_keys() {
+    use pgp::composed::{Deserializable, EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedPublicKey, SubkeyParamsBuilder};
+    use pgp::crypto::ecc_curve::ECCCurve;
+    use pgp::types::KeyDetails as _;
+    let s = server().await;
+    let mut encrypt = SubkeyParamsBuilder::default();
+    encrypt.key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy)).can_sign(false).can_encrypt(EncryptionCaps::All);
+    let mut params = SecretKeyParamsBuilder::default();
+    params
+        .key_type(KeyType::Ed25519Legacy)
+        .can_certify(true)
+        .can_sign(true)
+        .can_encrypt(EncryptionCaps::None)
+        .primary_user_id("Amy <amy@example.test>".into())
+        .user_ids(vec!["Amy Sales <sales@example.test>".into(), "amy@home.test".into()])
+        .subkeys(vec![encrypt.build().unwrap()]);
+    let public = SignedPublicKey::from(params.build().unwrap().generate(rand08::thread_rng()).unwrap());
+    let amy = s.state.db.account_by_email("amy@example.test").await.unwrap().unwrap();
+    let (token, h, p) = picacho_server::auth::generate_token();
+    s.state.db.create_token(amy.id, "settings", &h, &p, "account", None).await.unwrap();
+    let c = reqwest::Client::new();
+    let r = c
+        .put(format!("http://{}/api/v1/me/encryption", s.web))
+        .bearer_auth(&token)
+        .header("x-picacho", "1")
+        .json(&serde_json::json!({"public_key": public.to_armored_string(Default::default()).unwrap()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    s.state.db.create_alias("sales@example.test", "amy@example.test").await.unwrap();
+    s.state.db.create_alias("team@example.test", "amy@example.test").await.unwrap();
+
+    let get = |host: &str, path: String| {
+        let req = c.get(format!("http://{}{path}", s.web)).header("host", host);
+        async move {
+            let r = req.send().await.unwrap();
+            let ctype = r.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+            (r.status().as_u16(), ctype, r.bytes().await.unwrap().to_vec())
+        }
+    };
+    let user_ids = |bytes: &[u8]| -> Vec<String> {
+        let key = SignedPublicKey::from_bytes(bytes).unwrap();
+        key.verify_bindings().unwrap();
+        assert_eq!(key.fingerprint(), public.fingerprint());
+        key.details.users.iter().map(|u| String::from_utf8_lossy(u.id.id()).into_owned()).collect()
+    };
+
+    // The direct method, as the app asks: binary key, its User ID only.
+    let (status, ctype, body) = get("example.test", format!("/.well-known/openpgpkey/hu/{}?l=Amy", wkd_hash("amy"))).await;
+    assert_eq!((status, ctype.as_str()), (200, "application/octet-stream"));
+    assert_eq!(user_ids(&body), ["Amy <amy@example.test>"]);
+    // `l=` is optional.
+    let (status, _, body) = get("example.test", format!("/.well-known/openpgpkey/hu/{}", wkd_hash("amy"))).await;
+    assert_eq!(status, 200);
+    assert_eq!(user_ids(&body), ["Amy <amy@example.test>"]);
+    assert_eq!(get("example.test", "/.well-known/openpgpkey/policy".into()).await.0, 200);
+
+    // The advanced method, on openpgpkey.<domain>; an alias gets its owner's key.
+    let (status, ctype, body) = get("openpgpkey.example.test", format!("/.well-known/openpgpkey/example.test/hu/{}?l=sales", wkd_hash("sales"))).await;
+    assert_eq!((status, ctype.as_str()), (200, "application/octet-stream"));
+    assert_eq!(user_ids(&body), ["Amy Sales <sales@example.test>"]);
+    assert_eq!(get("openpgpkey.example.test", "/.well-known/openpgpkey/example.test/policy".into()).await.0, 200);
+    // The path's domain must be the host's.
+    assert_eq!(get("example.test", "/.well-known/openpgpkey/example.test/policy".into()).await.0, 404);
+    assert_eq!(get("openpgpkey.other.test", format!("/.well-known/openpgpkey/other.test/hu/{}?l=amy", wkd_hash("amy"))).await.0, 404);
+
+    // Nothing for addresses the key doesn't name, accounts without a key,
+    // unknown users, or domains not hosted here.
+    assert_eq!(get("example.test", format!("/.well-known/openpgpkey/hu/{}?l=team", wkd_hash("team"))).await.0, 404);
+    assert_eq!(get("example.test", format!("/.well-known/openpgpkey/hu/{}?l=bob", wkd_hash("bob"))).await.0, 404);
+    assert_eq!(get("example.test", format!("/.well-known/openpgpkey/hu/{}?l=nobody", wkd_hash("nobody"))).await.0, 404);
+    assert_eq!(get("home.test", format!("/.well-known/openpgpkey/hu/{}?l=amy", wkd_hash("amy"))).await.0, 404);
+    assert_eq!(get("home.test", "/.well-known/openpgpkey/policy".into()).await.0, 404);
+
+    // Turned off in the configuration ([web] wkd = false): nothing is published.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.storage.data_dir = dir.path().to_path_buf();
+    cfg.web.wkd = false;
+    let off = AppState::new(cfg).await.unwrap();
+    let d = off.db.create_domain("example.test", "local", "").await.unwrap();
+    let id = off.db.create_account("amy@example.test", d, "!", "Amy", "user", 0).await.unwrap();
+    let armored = public.to_armored_string(Default::default()).unwrap();
+    off.db.set_encryption_key(id, Some((&armored, "fp"))).await.unwrap();
+    let web = picacho_server::web::serve(off, "127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let r = c.get(format!("http://{web}/.well-known/openpgpkey/hu/{}?l=amy", wkd_hash("amy"))).header("host", "example.test").send().await.unwrap();
+    assert_eq!(r.status(), 404);
 }
 
 // ------------------------------------------------------------ CalDAV free/busy

@@ -2,6 +2,9 @@
 //!
 //! - `/.well-known/acme-challenge/<token>`: ACME HTTP-01.
 //! - `/.well-known/mta-sts.txt`: our MTA-STS policy (served on mta-sts.<domain>).
+//! - `/.well-known/openpgpkey/...`: the Web Key Directory
+//!   (draft-koch-openpgp-webkey-service), accounts' OpenPGP keys by address:
+//!   direct on <domain>, advanced on openpgpkey.<domain>.
 //! - Thunderbird autoconfig, Outlook Autodiscover, Apple configuration
 //!   profiles (.mobileconfig) with IMAP, SMTP, CalDAV and CardDAV.
 //! - `/healthz` (liveness), `/readyz` (database reachable, not shutting down).
@@ -20,6 +23,10 @@ pub fn routes(state: State) -> Router {
     Router::new()
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .route("/.well-known/mta-sts.txt", get(mta_sts))
+        .route("/.well-known/openpgpkey/policy", get(wkd_direct_policy))
+        .route("/.well-known/openpgpkey/hu/{hash}", get(wkd_direct_key))
+        .route("/.well-known/openpgpkey/{domain}/policy", get(wkd_advanced_policy))
+        .route("/.well-known/openpgpkey/{domain}/hu/{hash}", get(wkd_advanced_key))
         .route("/.well-known/autoconfig/mail/config-v1.1.xml", get(autoconfig))
         .route("/mail/config-v1.1.xml", get(autoconfig))
         .route("/autodiscover/autodiscover.xml", get(autodiscover).post(autodiscover))
@@ -90,6 +97,134 @@ async fn mta_sts(AxState(state): AxState<State>, headers: HeaderMap) -> Response
     }
     body.push_str("max_age: 604800\n");
     text("text/plain", body)
+}
+
+/// z-base-32, as WKD hashes local parts with it (the Picacho app's `zbase32`).
+fn zbase32(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+    let mut out = String::new();
+    let (mut buffer, mut bits) = (0u32, 0);
+    for &b in bytes {
+        buffer = (buffer << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            out.push(ALPHABET[((buffer >> (bits - 5)) & 31) as usize] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+/// The WKD hash of a local part: z-base-32 of the SHA-1 of it with ASCII
+/// letters lowercased (draft-koch-openpgp-webkey-service §3.1).
+fn wkd_hash(local: &str) -> String {
+    zbase32(ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, local.to_ascii_lowercase().as_bytes()).as_ref())
+}
+
+/// A domain the Web Key Directory answers for: a local, active domain here.
+async fn wkd_domain(state: &State, domain: &str) -> bool {
+    state.config.web.wkd && state.db.domain_by_name(domain).await.ok().flatten().is_some_and(|d| d.active && d.mode == "local")
+}
+
+/// The address `hash` stands for in `domain`: `l=` when the client sends
+/// it and it hashes to `hash`, else found among the domain's accounts and
+/// aliases (`l=` is optional, and older clients don't send it).
+async fn wkd_address(state: &State, domain: &str, hash: &str, local: Option<&str>) -> Option<String> {
+    let hash = hash.to_ascii_lowercase();
+    if let Some(l) = local.filter(|l| !l.is_empty() && wkd_hash(l) == hash) {
+        return Some(format!("{}@{domain}", l.to_ascii_lowercase()));
+    }
+    let accounts = state.db.list_accounts().await.ok()?.into_iter().map(|a| a.email);
+    let aliases = state.db.list_aliases().await.ok()?.into_iter().map(|a| a.source);
+    accounts.chain(aliases).find(|addr| addr.rsplit_once('@').is_some_and(|(l, d)| !l.is_empty() && d == domain && wkd_hash(l) == hash))
+}
+
+/// The keys published for `email`: its account's key, or for an alias the
+/// keys of the accounts it delivers to, each only where a User ID names
+/// `email` (see `encryption::wkd_key`). Concatenated, binary.
+async fn wkd_keys(state: &State, email: &str) -> Vec<u8> {
+    let accounts = match state.db.account_by_email(email).await.ok().flatten() {
+        Some(a) => vec![a],
+        None => {
+            let Some(alias) = state.db.alias_by_source(email).await.ok().flatten().filter(|a| a.active) else {
+                return Vec::new();
+            };
+            let mut found = Vec::new();
+            for d in alias.destination.split([',', ' ', '\n']).filter_map(crate::util::normalize_address) {
+                if let Some(a) = state.db.account_by_email(&d).await.ok().flatten() {
+                    found.push(a);
+                }
+            }
+            found
+        }
+    };
+    let mut out = Vec::new();
+    for a in accounts.into_iter().filter(|a| a.active) {
+        let Some(armored) = state.db.encryption_key(a.id).await.ok().flatten() else { continue };
+        let email = email.to_string();
+        if let Ok(Some(key)) = tokio::task::spawn_blocking(move || crate::encryption::wkd_key(&armored, &email)).await {
+            out.extend_from_slice(&key);
+        }
+    }
+    out
+}
+
+async fn wkd_policy(state: &State, domain: &str) -> Response {
+    if !wkd_domain(state, domain).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // An empty policy: keys are published, nothing more is offered.
+    ([(header::CONTENT_TYPE, "text/plain"), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], "").into_response()
+}
+
+async fn wkd_key(state: &State, domain: &str, hash: &str, q: &HashMap<String, String>) -> Response {
+    if !wkd_domain(state, domain).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(email) = wkd_address(state, domain, hash, q.get("l").map(String::as_str)).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let keys = wkd_keys(state, &email).await;
+    if keys.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "application/octet-stream"), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"), (header::CACHE_CONTROL, "no-cache")],
+        keys,
+    )
+        .into_response()
+}
+
+/// The direct method: requested on the mail domain itself.
+async fn wkd_direct_policy(AxState(state): AxState<State>, headers: HeaderMap) -> Response {
+    wkd_policy(&state, &host_of(&headers)).await
+}
+
+async fn wkd_direct_key(AxState(state): AxState<State>, headers: HeaderMap, Path(hash): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+    wkd_key(&state, &host_of(&headers), &hash, &q).await
+}
+
+/// The advanced method: on openpgpkey.<domain>, the domain in the path.
+fn advanced_domain(headers: &HeaderMap, domain: &str) -> Option<String> {
+    let domain = domain.to_ascii_lowercase();
+    (host_of(headers).strip_prefix("openpgpkey.") == Some(domain.as_str())).then_some(domain)
+}
+
+async fn wkd_advanced_policy(AxState(state): AxState<State>, headers: HeaderMap, Path(domain): Path<String>) -> Response {
+    match advanced_domain(&headers, &domain) {
+        Some(d) => wkd_policy(&state, &d).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn wkd_advanced_key(AxState(state): AxState<State>, headers: HeaderMap, Path((domain, hash)): Path<(String, String)>, Query(q): Query<HashMap<String, String>>) -> Response {
+    match advanced_domain(&headers, &domain) {
+        Some(d) => wkd_key(&state, &d, &hash, &q).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Mail and DAV endpoints for an address (`None` when not a local account).
@@ -348,3 +483,14 @@ async fn metrics(AxState(state): AxState<State>, ConnectInfo(peer): ConnectInfo<
     text("text/plain; version=0.0.4", crate::metrics::render(&state).await)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wkd_hash_matches_the_draft_example() {
+        // draft-koch-openpgp-webkey-service §3.1: Joe.Doe@Example.ORG.
+        assert_eq!(wkd_hash("Joe.Doe"), "iy9q119eutrkn8s1mk4r39qejnbu3n5q");
+        assert_eq!(wkd_hash("joe.doe"), wkd_hash("JOE.DOE"));
+    }
+}

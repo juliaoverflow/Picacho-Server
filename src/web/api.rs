@@ -908,6 +908,9 @@ fn dns_records(state: &State, d: &Domain) -> Value {
         recs.push(json!({"type": "SRV", "name": format!("_sieve._tcp.{}", d.name), "value": format!("0 1 {} {host}.", p.port()), "purpose": "Filter editing (ManageSieve)"}));
     }
     recs.push(json!({"type": "CNAME", "name": format!("autoconfig.{}", d.name), "value": format!("{host}."), "purpose": "Thunderbird/K-9 automatic setup"}));
+    if d.mode == "local" && state.config.web.wkd {
+        recs.push(json!({"type": "CNAME", "name": format!("openpgpkey.{}", d.name), "value": format!("{host}."), "purpose": "Web Key Directory: mail apps find accounts' OpenPGP keys (needs a certificate for this name)"}));
+    }
     // MTA-STS and TLS reporting for mail sent *to* this domain.
     let mode = state.settings().server.mta_sts_mode.clone().unwrap_or_else(|| "testing".into());
     if mode != "off" {
